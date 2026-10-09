@@ -58,6 +58,16 @@ io.use(socketAuth);
 notificationHandler(io);
 
 /*
+ * Register channel providers with the ChannelRegistry (Strategy Pattern).
+ */
+const { channelRegistry } = require("./src/registry/ChannelRegistry");
+const SocketChannelProvider = require("./src/providers/SocketChannelProvider");
+const FcmChannelProvider = require("./src/providers/FcmChannelProvider");
+
+channelRegistry.registerProvider(new SocketChannelProvider(io));
+channelRegistry.registerProvider(new FcmChannelProvider());
+
+/*
  * Register the HTTP routes for the notification system.
  * This handles fetching message history, marking messages as read, and unread counts.
  */

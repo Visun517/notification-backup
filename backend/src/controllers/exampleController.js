@@ -38,18 +38,21 @@ const triggerSimulation = catchAsync(async (req, res, next) => {
   }
 
   // Step 2: Construct the Notification Payload
-  // This is the exact object structure you need to pass to the sendNotification service
+  // Supports dynamic tags, multi-channel routing, and templating
   let payload = {
     scope: type,
     recipientId: recipientId,
     recipientRole: role,
+    tags: req.body.tags || (role ? [`role:${role}`] : []),
+    channels: req.body.channels || ["IN_APP", "PUSH"],
     region: region,
     district: district,
     title: "Test Alert",
     message: "This is a default test message.",
     category: "SYSTEM",
-    priority: "medium", // Priorities: low, medium, high, critical
-    actionUrl: "/home"  // The URL the user will be taken to when they click the notification
+    priority: "normal",
+    actionUrl: "/home",
+    data: req.body.data || {},
   };
 
   // Populate dummy data based on the requested testing scenario

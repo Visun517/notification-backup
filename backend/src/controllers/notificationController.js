@@ -38,6 +38,8 @@ const getNotifications = catchAsync(async (req, res, next) => {
     { recipientId: new mongoose.Types.ObjectId(userId) },
     { recipientRole: userRole },
     { recipientRole: "ALL" },
+    { tags: `role:${userRole}` },
+    { tags: "role:ALL" },
     { scope: "BROADCAST" },
   ];
 
@@ -183,6 +185,8 @@ const getUnreadCount = catchAsync(async (req, res, next) => {
           { recipientId: new mongoose.Types.ObjectId(userId) },
           { recipientRole: userRole },
           { recipientRole: "ALL" },
+          { tags: `role:${userRole}` },
+          { tags: "role:ALL" },
           { region: userDivision },
           { district: userDistrict },
           { scope: "BROADCAST" },
@@ -272,6 +276,8 @@ const markAllAsRead = catchAsync(async (req, res, next) => {
   const orConditions = [
     { recipientRole: userRole },
     { recipientRole: "ALL" },
+    { tags: `role:${userRole}` },
+    { tags: "role:ALL" },
     { scope: "BROADCAST" },
   ];
   if (userDivision) orConditions.push({ region: userDivision });
@@ -351,6 +357,8 @@ const clearAllNotifications = catchAsync(async (req, res, next) => {
   const orConditions = [
     { recipientRole: userRole },
     { recipientRole: "ALL" },
+    { tags: `role:${userRole}` },
+    { tags: "role:ALL" },
     { scope: "BROADCAST" },
   ];
   if (userDivision) orConditions.push({ region: userDivision });
