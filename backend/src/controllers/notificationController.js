@@ -5,33 +5,21 @@ const catchAsync = require("../utils/catchAsync");
 const AppError = require("../errors/appError");
 const logger = require("../utils/logger");
 const { getRegionFromCoords } = require("../utils/locationHelper");
-const User = require("../models/User");
 
 /**
  * 1. Fetch notifications with Pagination
  * GET /api/notifications?page=1&limit=20
  *
- * Description: Retrieves a list of notifications for the logged-in user.
- * It loads messages in chunks (pagination) to save data and improve speed.
+ * Description: Retrieves a list of notifications for the authenticated user.
  */
 const getNotifications = catchAsync(async (req, res, next) => {
-  const userId = req.headers["user-id"];
-
-  if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
-    return next(
-      new AppError(
-        "Testing Error: Please provide valid 'user-id' in Headers",
-        400,
-      ),
-    );
-  }
-
-  const user = await User.findById(userId);
-  if (!user) return next(new AppError("User not found in Database", 404));
+  // Extract authenticated user populated by JWT auth middleware
+  const user = req.user;
+  const userId = req.userId || user._id.toString();
 
   const userRole = user.role;
-  let userDistrict = null,
-    userDivision = null;
+  let userDistrict = null;
+  let userDivision = null;
 
   if (user.currentLocation?.coordinates) {
     const [lng, lat] = user.currentLocation.coordinates;
@@ -64,7 +52,7 @@ const getNotifications = catchAsync(async (req, res, next) => {
     { $group: { _id: "$_id", doc: { $first: "$$ROOT" } } },
     { $replaceRoot: { newRoot: "$doc" } },
 
-    // 🚀 CRITICAL PERFORMANCE FIX: Sort & Paginate BEFORE $lookup
+    // Sort & Paginate BEFORE $lookup
     { $sort: { createdAt: -1 } },
     { $skip: skip },
     { $limit: limit },
@@ -120,16 +108,8 @@ const getNotifications = catchAsync(async (req, res, next) => {
  * Description: Marks a specific notification as 'read' when the user clicks on it.
  */
 const markAsRead = catchAsync(async (req, res, next) => {
-  const { id } = req.params; // The ID of the notification from the URL
-
-  // Get user ID from headers (for testing)
-  const userId = req.headers["user-id"];
-
-  if (!userId) {
-    return next(
-      new AppError("Testing Error: Please provide 'user-id' in Headers", 400),
-    );
-  }
+  const { id } = req.params;
+  const userId = req.userId || req.user._id.toString();
 
   // Validate if the provided ID is a valid MongoDB ObjectId
   if (!mongoose.Types.ObjectId.isValid(id)) {
@@ -140,16 +120,15 @@ const markAsRead = catchAsync(async (req, res, next) => {
   const notification = await Notification.findById(id);
 
   if (!notification) {
-    logger.warn(` MarkAsRead Failed: Notification ${id} not found.`);
+    logger.warn(`MarkAsRead Failed: Notification ${id} not found.`);
     return next(new AppError("No notification found with that ID", 404));
   }
 
-  // If it's a private message, simply update the 'isRead' boolean
+  // If it's a private message, verify ownership and update 'isRead'
   if (notification.scope === "UNICAST") {
-    // Security check: ensure the user owns this message
     if (notification.recipientId.toString() !== userId) {
       logger.warn(
-        ` Unauthorized read attempt by User ${userId} on Notif ${id}`,
+        `Unauthorized read attempt by User ${userId} on Notif ${id}`,
       );
       return next(
         new AppError("Unauthorized access to this notification", 403),
@@ -158,8 +137,7 @@ const markAsRead = catchAsync(async (req, res, next) => {
     notification.isRead = true;
     await notification.save();
   } else {
-    // If it's a public message, add a new record to the ReadStatus collection
-    // 'upsert: true' creates a new record if it doesn't exist
+    // If it's a public message, add or update a record in NotificationReadStatus
     await NotificationReadStatus.updateOne(
       { notificationId: id, userId },
       { $setOnInsert: { readAt: new Date() } },
@@ -167,7 +145,7 @@ const markAsRead = catchAsync(async (req, res, next) => {
     );
   }
 
-  logger.info(` Notification ${id} marked as read by User ${userId}`);
+  logger.info(`Notification ${id} marked as read by User ${userId}`);
 
   res.status(200).json({
     status: "success",
@@ -179,26 +157,17 @@ const markAsRead = catchAsync(async (req, res, next) => {
  * 3. Get total unread count
  * GET /api/notifications/unread-count
  *
- * Description: Calculates how many unread messages the user has.
- * This is useful for displaying the red badge number on the notification bell icon.
+ * Description: Calculates how many unread messages the authenticated user has.
  */
 const getUnreadCount = catchAsync(async (req, res, next) => {
-  const userId = req.headers["user-id"];
-
-  if (!userId) {
-    return next(
-      new AppError("Testing Error: Please provide 'user-id' in Headers", 400),
-    );
-  }
-
-  const user = await User.findById(userId);
-  if (!user) return next(new AppError("User not found in Database", 404));
+  const user = req.user;
+  const userId = req.userId || user._id.toString();
 
   const userRole = user.role;
   let userDistrict = null;
   let userDivision = null;
 
-  if (user.currentLocation && user.currentLocation.coordinates) {
+  if (user.currentLocation?.coordinates) {
     const [lng, lat] = user.currentLocation.coordinates;
     const regionData = await getRegionFromCoords(lat, lng);
     if (regionData && typeof regionData === "object") {
@@ -275,23 +244,19 @@ const getUnreadCount = catchAsync(async (req, res, next) => {
     },
   });
 });
+
 /**
- * 4. Mark all notifications as read for a user
+ * 4. Mark all notifications as read for the authenticated user
  * PATCH /api/notifications/mark-all-read
  */
-
 const markAllAsRead = catchAsync(async (req, res, next) => {
-  const userId = req.headers["user-id"];
-
-  if (!userId) return next(new AppError("User ID required", 400));
-
-  const user = await User.findById(userId);
-  if (!user) return next(new AppError("User not found", 404));
+  const user = req.user;
+  const userId = req.userId || user._id.toString();
 
   const { role: userRole, currentLocation } = user;
 
-  let userDistrict = null,
-    userDivision = null;
+  let userDistrict = null;
+  let userDivision = null;
   if (currentLocation?.coordinates) {
     const [lng, lat] = currentLocation.coordinates;
     const regionData = await getRegionFromCoords(lat, lng);
@@ -350,11 +315,11 @@ const markAllAsRead = catchAsync(async (req, res, next) => {
       },
     }));
 
-      await NotificationReadStatus.bulkWrite(bulkOps, { ordered: false }).catch(
-        (e) => {
-          console.error("Error in bulkWrite for markAllAsRead:", e.message);
-        },
-      );
+    await NotificationReadStatus.bulkWrite(bulkOps, { ordered: false }).catch(
+      (e) => {
+        logger.error(`Error in bulkWrite for markAllAsRead: ${e.message}`);
+      },
+    );
   }
 
   res.status(200).json({
@@ -364,22 +329,17 @@ const markAllAsRead = catchAsync(async (req, res, next) => {
 });
 
 /**
- * 5. Clear all notifications for a user
- * DELETE /api/notifications/clear-all
+ * 5. Clear all notifications for the authenticated user
+ * DELETE /api/notifications/clear-all-notifications
  */
-
 const clearAllNotifications = catchAsync(async (req, res, next) => {
-  const userId = req.headers["user-id"];
-
-  if (!userId) return next(new AppError("User ID required", 400));
-
-  const user = await User.findById(userId);
-  if (!user) return next(new AppError("User not found", 404));
+  const user = req.user;
+  const userId = req.userId || user._id.toString();
 
   const { role: userRole, currentLocation } = user;
 
-  let userDistrict = null,
-    userDivision = null;
+  let userDistrict = null;
+  let userDivision = null;
   if (currentLocation?.coordinates) {
     const [lng, lat] = currentLocation.coordinates;
     const regionData = await getRegionFromCoords(lat, lng);
@@ -438,7 +398,7 @@ const clearAllNotifications = catchAsync(async (req, res, next) => {
 
     await NotificationReadStatus.bulkWrite(bulkOps, { ordered: false }).catch(
       (e) => {
-        console.error("Error in bulkWrite for clearAll:", e.message);
+        logger.error(`Error in bulkWrite for clearAll: ${e.message}`);
       },
     );
   }

@@ -3,12 +3,10 @@
  *
  * Description:
  * This file defines the API endpoints (URL paths) for the notification system.
- * It acts as a bridge, connecting incoming web requests from the frontend to the logic in the controllers.
+ * All notification endpoints are protected by cryptographic JWT authentication middleware.
  */
 
 const express = require("express");
-
-// Create an Express router to handle these specific routes
 const router = express.Router();
 
 // Import the main notification logic (Controllers)
@@ -23,37 +21,46 @@ const {
 // Import the testing/simulation controller
 const { triggerSimulation } = require("../controllers/exampleController");
 
+// Import JWT authentication middleware
+const protect = require("../middleware/authMiddleware");
+
+// Enforce JWT authentication on all notification routes
+router.use(protect);
+
 /**
  * Route: GET /
- * Description: Fetches all notifications (with pagination) for the logged-in user.
- * This includes personal messages (UNICAST), group alerts (MULTICAST), and public broadcasts.
+ * Description: Fetches all notifications (with pagination) for the authenticated user.
  */
 router.get("/", getNotifications);
 
 /**
  * Route: GET /unread-count
- * Description: Gets the total number of messages that the user has not read yet.
- * This is used to display the red badge/number on the notification bell icon.
+ * Description: Gets the total number of messages that the authenticated user has not read yet.
  */
 router.get("/unread-count", getUnreadCount);
 
 /**
  * Route: PATCH /:id/read
- * Description: Marks a specific notification as "read".
- * @param {string} id - The unique ID of the notification passed in the URL.
+ * Description: Marks a specific notification as "read" for the authenticated user.
  */
 router.patch("/:id/read", markAsRead);
 
 /**
+ * Route: PATCH /mark-all-read
+ * Description: Marks all notifications as read for the authenticated user.
+ */
+router.patch("/mark-all-read", markAllAsRead);
+
+/**
+ * Route: DELETE /clear-all-notifications
+ * Description: Clears/deletes all notifications for the authenticated user.
+ */
+router.delete("/clear-all-notifications", clearAllNotifications);
+
+/**
  * Route: POST /simulate-system-update
- * Description: A special testing route to manually trigger different notification scenarios via Postman.
- * Note: Keep this route only for development/testing purposes. 
+ * Description: Testing route to simulate notification events.
  */
 router.post("/simulate-system-update", triggerSimulation);
 
-router.patch("/mark-all-read", markAllAsRead);
-
-router.delete("/clear-all-notifications", clearAllNotifications);
-
-// Export the router so it can be registered in the main server.js file
 module.exports = router;

@@ -57,35 +57,35 @@ module.exports = (io) => {
         const regionData = await getRegionFromCoords(lat, lng);
 
         if (regionData && typeof regionData === "object") {
-          // Add user to the relevant Socket rooms
+          // Add user to the relevant Socket rooms (instant in-memory operation)
           socketService.manageRegionalRooms(socket, regionData, role, "join");
-
-          // Subscribe user to the relevant Firebase (FCM) topics
-          if (socket.fcmToken) {
-            await fcmService.manageRegionalTopics(
-              socket.fcmToken,
-              regionData,
-              role,
-              "subscribe",
-            );
-          }
 
           // Save current location details in the socket session to track future movements
           socket.currentDivision = regionData.division;
           socket.currentDistrict = regionData.district;
 
+          // DECOUPLED ASYNC TASK: Subscribe to FCM topics without blocking WebSocket event loop
+          if (socket.fcmToken) {
+            const token = socket.fcmToken;
+            setImmediate(async () => {
+              try {
+                await fcmService.manageRegionalTopics(
+                  token,
+                  regionData,
+                  role,
+                  "subscribe",
+                );
+              } catch (fcmErr) {
+                logger.error(
+                  `Background FCM initial subscribe failed for User=${userId}: ${fcmErr.message}`,
+                );
+              }
+            });
+          }
+
           logger.info(
             `Initial Sync Success: User=${userId}, Region=${regionData.division}`,
           );
-
-          // For debugging purposes: Print the rooms the user is currently in
-          setTimeout(() => {
-            const activeRooms = Array.from(socket.rooms);
-            console.log("-----------------------------------------");
-            console.log(` User ${userId} is now in these Rooms:`);
-            console.table(activeRooms);
-            console.log("-----------------------------------------");
-          }, 1000);
         }
       }
     } catch (err) {
@@ -96,13 +96,12 @@ module.exports = (io) => {
     // Listens to live GPS updates from the client app
     socket.on("update_location", async (data) => {
       try {
-        // This lock keeps two location updates from running at the same time.
+        // Concurrency lock: prevent overlapping location updates for this socket
         if (socket.isUpdatingLocation) {
           logger.debug(`Location update already running for user ${userId}`);
           return;
         }
 
-        // This lock stops overlapping room changes and duplicate joins.
         socket.isUpdatingLocation = true;
 
         const { lat, lng } = data;
@@ -112,7 +111,7 @@ module.exports = (io) => {
         }
 
         // PERFORMANCE OPTIMIZATION (Throttling)
-        // If the user moved less than 100 meters, skip the expensive region check
+        // If user moved less than 100 meters, skip the expensive region check
         if (socket.lastLat && socket.lastLng) {
           const distance = calculateDistance(
             socket.lastLat,
@@ -125,7 +124,7 @@ module.exports = (io) => {
           }
         }
 
-        // Update last known coordinates in the socket session
+        // Update last known coordinates in socket session
         socket.lastLat = lat;
         socket.lastLng = lng;
 
@@ -137,48 +136,49 @@ module.exports = (io) => {
           typeof regionData === "object" &&
           regionData.division !== socket.currentDivision
         ) {
-          // 1. Leave the old socket rooms and unsubscribe from old FCM topics
-          socketService.manageRegionalRooms(
-            socket,
-            {
-              division: socket.currentDivision,
-              district: socket.currentDistrict,
-            },
-            role,
-            "leave",
-          );
+          const oldRegion = {
+            division: socket.currentDivision,
+            district: socket.currentDistrict,
+          };
 
-          if (socket.fcmToken) {
-            await fcmService.manageRegionalTopics(
-              socket.fcmToken,
-              {
-                division: socket.currentDivision,
-                district: socket.currentDistrict,
-              },
-              role,
-              "unsubscribe",
-            );
-          }
-
-          // 2. Join the new socket rooms and subscribe to new FCM topics
+          // 1. Manage Socket.io rooms immediately in memory
+          socketService.manageRegionalRooms(socket, oldRegion, role, "leave");
           socketService.manageRegionalRooms(socket, regionData, role, "join");
-
-          if (socket.fcmToken) {
-            await fcmService.manageRegionalTopics(
-              socket.fcmToken,
-              regionData,
-              role,
-              "subscribe",
-            );
-          }
 
           logger.info(
             `🔄 Region Switch: User=${userId}, From=${socket.currentDivision}, To=${regionData.division}`,
           );
 
-          // Update the current region in the socket session
+          // Update current region in socket session
           socket.currentDivision = regionData.division;
           socket.currentDistrict = regionData.district;
+
+          // 2. DECOUPLED ASYNC TASK: Handle external FCM topic un/subscribes in the background
+          if (socket.fcmToken) {
+            const token = socket.fcmToken;
+            setImmediate(async () => {
+              try {
+                if (oldRegion.division && oldRegion.district) {
+                  await fcmService.manageRegionalTopics(
+                    token,
+                    oldRegion,
+                    role,
+                    "unsubscribe",
+                  );
+                }
+                await fcmService.manageRegionalTopics(
+                  token,
+                  regionData,
+                  role,
+                  "subscribe",
+                );
+              } catch (fcmErr) {
+                logger.error(
+                  `Background FCM region switch failed for User=${userId}: ${fcmErr.message}`,
+                );
+              }
+            });
+          }
         }
 
         // Always update the exact GPS location in the Database
@@ -186,7 +186,6 @@ module.exports = (io) => {
       } catch (error) {
         handleSocketError(error, "update_location");
       } finally {
-        // This releases the lock when the update is done.
         socket.isUpdatingLocation = false;
       }
     });
@@ -204,10 +203,10 @@ module.exports = (io) => {
 const updateDBLocation = async (userId, lat, lng, role) => {
   try {
     await User.findByIdAndUpdate(userId, {
-      currentLocation: { type: "Point", coordinates: [lng, lat] }, // [longitude, latitude]
+      currentLocation: { type: "Point", coordinates: [lng, lat] },
       ...(role === "DRIVER" && { showCurrentLocation: true }),
     });
   } catch (err) {
-    logger.error(` DB Update Failed for User=${userId}: ${err.message}`);
+    logger.error(`DB Update Failed for User=${userId}: ${err.message}`);
   }
 };
