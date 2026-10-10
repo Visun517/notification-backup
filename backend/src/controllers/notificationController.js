@@ -5,6 +5,7 @@ const catchAsync = require("../utils/catchAsync");
 const AppError = require("../errors/appError");
 const logger = require("../utils/logger");
 const { getRegionFromCoords } = require("../utils/locationHelper");
+const redisHelper = require("../config/redisClient");
 
 /**
  * 1. Fetch notifications with Pagination
@@ -147,6 +148,9 @@ const markAsRead = catchAsync(async (req, res, next) => {
     );
   }
 
+  // Decrement cached unread count atomically in Redis
+  await redisHelper.safeDecr(`user:${userId}:unread_count`);
+
   logger.info(`Notification ${id} marked as read by User ${userId}`);
 
   res.status(200).json({
@@ -169,6 +173,21 @@ const getUnreadCount = catchAsync(async (req, res, next) => {
   let userDistrict = null;
   let userDivision = null;
 
+  const countKey = `user:${userId}:unread_count`;
+
+  // 1. Check Redis Cache first (Cache-Aside Pattern)
+  const cachedCount = await redisHelper.safeGet(countKey);
+  if (cachedCount !== null && cachedCount !== undefined) {
+    return res.status(200).json({
+      status: "success",
+      source: "cache",
+      data: {
+        unreadCount: parseInt(cachedCount, 10),
+      },
+    });
+  }
+
+  // 2. Cache Miss: Execute MongoDB Aggregation Pipeline
   if (user.currentLocation?.coordinates) {
     const [lng, lat] = user.currentLocation.coordinates;
     const regionData = await getRegionFromCoords(lat, lng);
@@ -182,7 +201,7 @@ const getUnreadCount = catchAsync(async (req, res, next) => {
     {
       $match: {
         $or: [
-          { recipientId: new mongoose.Types.ObjectId(userId) },
+          { recipientId: mongoose.Types.ObjectId.isValid(userId) ? new mongoose.Types.ObjectId(userId) : userId },
           { recipientRole: userRole },
           { recipientRole: "ALL" },
           { tags: `role:${userRole}` },
@@ -241,8 +260,12 @@ const getUnreadCount = catchAsync(async (req, res, next) => {
 
   const count = result.length > 0 ? result[0].totalUnread : 0;
 
+  // 3. Cache the calculated count in Redis (1h TTL)
+  await redisHelper.safeSet(countKey, count, 3600);
+
   res.status(200).json({
     status: "success",
+    source: "database",
     data: {
       unreadCount: count,
     },
@@ -328,6 +351,9 @@ const markAllAsRead = catchAsync(async (req, res, next) => {
     );
   }
 
+  // Reset cached unread count in Redis to 0
+  await redisHelper.safeSet(`user:${userId}:unread_count`, 0, 3600);
+
   res.status(200).json({
     status: "success",
     message: "All notifications safely marked as read",
@@ -410,6 +436,9 @@ const clearAllNotifications = catchAsync(async (req, res, next) => {
       },
     );
   }
+
+  // Reset cached unread count in Redis to 0
+  await redisHelper.safeSet(`user:${userId}:unread_count`, 0, 3600);
 
   res.status(200).json({
     status: "success",

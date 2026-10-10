@@ -69,7 +69,7 @@ const notificationSchema = new Schema(
     status: {
       type: String,
       enum: Object.values(NOTIFICATION_STATUSES),
-      default: NOTIFICATION_STATUSES.PENDING,
+      default: NOTIFICATION_STATUSES.QUEUED,
     },
 
     // 3. Location Data (Spatial targeting)

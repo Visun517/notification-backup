@@ -50,7 +50,21 @@ const userSchema = new Schema({
 
   showCurrentLocation: {
     type: Boolean,
-    default: true
+    default: true,
+  },
+
+  notificationPreferences: {
+    channels: {
+      type: Map,
+      of: Boolean,
+      default: {
+        IN_APP: true,
+        PUSH: true,
+        EMAIL: true,
+        SMS: true,
+        WEBHOOK: true,
+      },
+    },
   },
 
   touristDetails: {

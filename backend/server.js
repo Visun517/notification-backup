@@ -28,6 +28,24 @@ const io = new Server(server, {
   },
 });
 
+/*
+ * Distributed Socket.io Adapter Setup.
+ * Attaches @socket.io/redis-adapter so that room broadcasts propagate across clustered instances.
+ */
+const { createAdapter } = require("@socket.io/redis-adapter");
+const { initRedis, pubClient, subClient } = require("./src/config/redisClient");
+
+initRedis()
+  .then((connected) => {
+    if (connected) {
+      io.adapter(createAdapter(pubClient, subClient));
+      console.log("🔌 [Socket.io] Attached distributed Redis adapter.");
+    }
+  })
+  .catch((err) => {
+    console.error("⚠️ [Socket.io] Redis adapter setup failed:", err.message);
+  });
+
 app.use(
   cors({
     origin: process.env.CORS_ORIGIN || "http://localhost:5173", // Frontend URL එක
@@ -66,6 +84,12 @@ const FcmChannelProvider = require("./src/providers/FcmChannelProvider");
 
 channelRegistry.registerProvider(new SocketChannelProvider(io));
 channelRegistry.registerProvider(new FcmChannelProvider());
+
+/*
+ * Start BullMQ asynchronous background worker for decoupled notification delivery.
+ */
+const { startNotificationWorker } = require("./src/workers/notificationWorker");
+startNotificationWorker();
 
 /*
  * Register the HTTP routes for the notification system.
