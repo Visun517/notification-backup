@@ -95,6 +95,13 @@ startNotificationWorker();
  * Register the HTTP routes for the notification system.
  * This handles fetching message history, marking messages as read, and unread counts.
  */
+const { getHealthStatus } = require("./src/utils/healthCheck");
+app.get("/health/notifications", async (req, res) => {
+  const health = await getHealthStatus();
+  const statusCode = health.status === "UNHEALTHY" ? 503 : 200;
+  res.status(statusCode).json(health);
+});
+
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/user", userRoutes);
 

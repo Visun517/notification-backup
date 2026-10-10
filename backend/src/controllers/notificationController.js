@@ -6,6 +6,22 @@ const AppError = require("../errors/appError");
 const logger = require("../utils/logger");
 const { getRegionFromCoords } = require("../utils/locationHelper");
 const redisHelper = require("../config/redisClient");
+const { getHealthStatus } = require("../utils/healthCheck");
+const { telemetry } = require("../utils/telemetry");
+
+/**
+ * Extracts tenantId from request header, query, authenticated user, or defaults to "default".
+ */
+const getTenantId = (req) => {
+  if (!req) return "default";
+  return (
+    req.tenantId ||
+    req.headers?.["x-tenant-id"] ||
+    req.query?.tenantId ||
+    req.user?.tenantId ||
+    "default"
+  );
+};
 
 /**
  * 1. Fetch notifications with Pagination
@@ -47,9 +63,16 @@ const getNotifications = catchAsync(async (req, res, next) => {
   if (userDivision) matchCriteria.push({ region: userDivision });
   if (userDistrict) matchCriteria.push({ district: userDistrict });
 
+  const tenantId = getTenantId(req);
+
   const notifications = await Notification.aggregate([
-    // 1. Filter Messages
-    { $match: { $or: matchCriteria } },
+    // 1. Filter Messages partitioned by tenantId
+    {
+      $match: {
+        tenantId,
+        $or: matchCriteria,
+      },
+    },
 
     // 2. Deduplicate (Remove identical messages)
     { $group: { _id: "$_id", doc: { $first: "$$ROOT" } } },
@@ -119,12 +142,20 @@ const markAsRead = catchAsync(async (req, res, next) => {
     return next(new AppError("Invalid Notification ID format", 400));
   }
 
+  const tenantId = getTenantId(req);
+
   // Find the notification in the database
   const notification = await Notification.findById(id);
 
   if (!notification) {
     logger.warn(`MarkAsRead Failed: Notification ${id} not found.`);
     return next(new AppError("No notification found with that ID", 404));
+  }
+
+  // Cross-tenant protection
+  if (notification.tenantId && notification.tenantId !== tenantId) {
+    logger.warn(`Cross-tenant markAsRead attempt: Notification ${id} belongs to ${notification.tenantId}, requested by ${tenantId}`);
+    return next(new AppError("Unauthorized access to notification across tenants", 403));
   }
 
   // If it's a private message, verify ownership and update 'isRead'
@@ -142,16 +173,19 @@ const markAsRead = catchAsync(async (req, res, next) => {
   } else {
     // If it's a public message, add or update a record in NotificationReadStatus
     await NotificationReadStatus.updateOne(
-      { notificationId: id, userId },
+      { tenantId, notificationId: id, userId },
       { $setOnInsert: { readAt: new Date() } },
       { upsert: true },
     );
   }
 
-  // Decrement cached unread count atomically in Redis
-  await redisHelper.safeDecr(`user:${userId}:unread_count`);
+  // Decrement cached unread count atomically in Redis (partitioned by tenantId)
+  await redisHelper.safeDecr(`tenant:${tenantId}:user:${userId}:unread_count`);
+  if (tenantId === "default") {
+    await redisHelper.safeDecr(`user:${userId}:unread_count`);
+  }
 
-  logger.info(`Notification ${id} marked as read by User ${userId}`);
+  logger.info(`Notification ${id} marked as read by User ${userId} [Tenant: ${tenantId}]`);
 
   res.status(200).json({
     status: "success",
@@ -173,14 +207,20 @@ const getUnreadCount = catchAsync(async (req, res, next) => {
   let userDistrict = null;
   let userDivision = null;
 
-  const countKey = `user:${userId}:unread_count`;
+  const tenantId = getTenantId(req);
+  const countKey = `tenant:${tenantId}:user:${userId}:unread_count`;
+  const legacyCountKey = `user:${userId}:unread_count`;
 
   // 1. Check Redis Cache first (Cache-Aside Pattern)
-  const cachedCount = await redisHelper.safeGet(countKey);
+  let cachedCount = await redisHelper.safeGet(countKey);
+  if (cachedCount === null && tenantId === "default") {
+    cachedCount = await redisHelper.safeGet(legacyCountKey);
+  }
   if (cachedCount !== null && cachedCount !== undefined) {
     return res.status(200).json({
       status: "success",
       source: "cache",
+      tenantId,
       data: {
         unreadCount: parseInt(cachedCount, 10),
       },
@@ -200,6 +240,7 @@ const getUnreadCount = catchAsync(async (req, res, next) => {
   const result = await Notification.aggregate([
     {
       $match: {
+        tenantId,
         $or: [
           { recipientId: mongoose.Types.ObjectId.isValid(userId) ? new mongoose.Types.ObjectId(userId) : userId },
           { recipientRole: userRole },
@@ -262,10 +303,14 @@ const getUnreadCount = catchAsync(async (req, res, next) => {
 
   // 3. Cache the calculated count in Redis (1h TTL)
   await redisHelper.safeSet(countKey, count, 3600);
+  if (tenantId === "default") {
+    await redisHelper.safeSet(legacyCountKey, count, 3600);
+  }
 
   res.status(200).json({
     status: "success",
     source: "database",
+    tenantId,
     data: {
       unreadCount: count,
     },
@@ -291,8 +336,10 @@ const markAllAsRead = catchAsync(async (req, res, next) => {
     userDistrict = regionData?.district;
   }
 
+  const tenantId = getTenantId(req);
+
   await Notification.updateMany(
-    { recipientId: userId, isRead: false },
+    { tenantId, recipientId: userId, isRead: false },
     { $set: { isRead: true } },
   );
 
@@ -307,7 +354,7 @@ const markAllAsRead = catchAsync(async (req, res, next) => {
   if (userDistrict) orConditions.push({ district: userDistrict });
 
   const unreadNotifications = await Notification.aggregate([
-    { $match: { scope: { $ne: "UNICAST" }, $or: orConditions } },
+    { $match: { tenantId, scope: { $ne: "UNICAST" }, $or: orConditions } },
     {
       $lookup: {
         from: "notificationreadstatuses",
@@ -336,6 +383,7 @@ const markAllAsRead = catchAsync(async (req, res, next) => {
     const bulkOps = unreadNotifications.map((n) => ({
       updateOne: {
         filter: {
+          tenantId,
           notificationId: n._id,
           userId: new mongoose.Types.ObjectId(userId),
         },
@@ -351,8 +399,11 @@ const markAllAsRead = catchAsync(async (req, res, next) => {
     );
   }
 
-  // Reset cached unread count in Redis to 0
-  await redisHelper.safeSet(`user:${userId}:unread_count`, 0, 3600);
+  // Reset cached unread count in Redis to 0 (partitioned by tenantId)
+  await redisHelper.safeSet(`tenant:${tenantId}:user:${userId}:unread_count`, 0, 3600);
+  if (tenantId === "default") {
+    await redisHelper.safeSet(`user:${userId}:unread_count`, 0, 3600);
+  }
 
   res.status(200).json({
     status: "success",
@@ -378,7 +429,9 @@ const clearAllNotifications = catchAsync(async (req, res, next) => {
     userDivision = regionData?.division;
     userDistrict = regionData?.district;
   }
-  await Notification.deleteMany({ recipientId: userId, scope: "UNICAST" });
+  const tenantId = getTenantId(req);
+
+  await Notification.deleteMany({ tenantId, recipientId: userId, scope: "UNICAST" });
 
   const orConditions = [
     { recipientRole: userRole },
@@ -391,7 +444,7 @@ const clearAllNotifications = catchAsync(async (req, res, next) => {
   if (userDistrict) orConditions.push({ district: userDistrict });
 
   const publicNotifications = await Notification.aggregate([
-    { $match: { scope: { $ne: "UNICAST" }, $or: orConditions } },
+    { $match: { tenantId, scope: { $ne: "UNICAST" }, $or: orConditions } },
     {
       $lookup: {
         from: "notificationreadstatuses",
@@ -419,6 +472,7 @@ const clearAllNotifications = catchAsync(async (req, res, next) => {
     const bulkOps = publicNotifications.map((n) => ({
       updateOne: {
         filter: {
+          tenantId,
           notificationId: n._id,
           userId: new mongoose.Types.ObjectId(userId),
         },
@@ -437,13 +491,39 @@ const clearAllNotifications = catchAsync(async (req, res, next) => {
     );
   }
 
-  // Reset cached unread count in Redis to 0
-  await redisHelper.safeSet(`user:${userId}:unread_count`, 0, 3600);
+  // Reset cached unread count in Redis to 0 (partitioned by tenantId)
+  await redisHelper.safeSet(`tenant:${tenantId}:user:${userId}:unread_count`, 0, 3600);
+  if (tenantId === "default") {
+    await redisHelper.safeSet(`user:${userId}:unread_count`, 0, 3600);
+  }
 
   res.status(200).json({
     status: "success",
     message: "All notifications cleared successfully",
   });
+});
+
+/**
+ * 6. Health Check Endpoint
+ * GET /api/notifications/health
+ */
+const getHealth = catchAsync(async (req, res) => {
+  const health = await getHealthStatus();
+  const statusCode = health.status === "UNHEALTHY" ? 503 : 200;
+  res.status(statusCode).json(health);
+});
+
+/**
+ * 7. Prometheus Metrics Endpoint
+ * GET /api/notifications/metrics
+ */
+const getMetrics = catchAsync(async (req, res) => {
+  const format = req.query.format || (req.headers.accept?.includes("json") ? "json" : "prometheus");
+  if (format === "json") {
+    return res.status(200).json(telemetry.getMetricsSummary());
+  }
+  res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+  res.status(200).send(telemetry.getPrometheusMetrics());
 });
 
 module.exports = {
@@ -452,4 +532,6 @@ module.exports = {
   getUnreadCount,
   markAllAsRead,
   clearAllNotifications,
+  getHealth,
+  getMetrics,
 };

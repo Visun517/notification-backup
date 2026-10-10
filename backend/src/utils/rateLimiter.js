@@ -20,6 +20,7 @@ class RateLimiter {
    */
   async checkRateLimit(recipientId, channel = "PUSH", options = {}) {
     const {
+      tenantId = "default",
       maxRequests = 5,
       windowSeconds = 600,
       priority = "normal",
@@ -27,7 +28,7 @@ class RateLimiter {
 
     // 1. Critical & High priority notifications ALWAYS bypass rate limiting (safety, OTPs, security)
     if (priority === "critical" || priority === "high") {
-      logger.info(`⚡ [RateLimiter] Priority '${priority}' bypassed rate limit for User: ${recipientId}`);
+      logger.info(`⚡ [RateLimiter] Priority '${priority}' bypassed rate limit for Tenant: ${tenantId}, User: ${recipientId}`);
       return { allowed: true, currentCount: 0, limit: maxRequests, bypassed: true };
     }
 
@@ -41,7 +42,7 @@ class RateLimiter {
       return { allowed: true, currentCount: 0, limit: maxRequests, fallback: true };
     }
 
-    const key = `ratelimit:${channel}:${recipientId}`;
+    const key = `tenant:${tenantId}:ratelimit:${channel}:${recipientId}`;
 
     try {
       // Atomic increment
@@ -54,8 +55,12 @@ class RateLimiter {
 
       if (count > maxRequests) {
         logger.warn(
-          `🚫 [RateLimiter] Rate limit exceeded for User ${recipientId} on channel '${channel}' (${count}/${maxRequests} in ${windowSeconds}s).`,
+          `🚫 [RateLimiter] Rate limit exceeded for Tenant ${tenantId}, User ${recipientId} on channel '${channel}' (${count}/${maxRequests} in ${windowSeconds}s).`,
         );
+        try {
+          const { telemetry } = require("./telemetry");
+          telemetry.recordRateLimited({ tenantId, channel });
+        } catch (_) {}
         return {
           allowed: false,
           currentCount: count,
@@ -78,8 +83,8 @@ class RateLimiter {
   /**
    * Resets rate limit counter for a recipient and channel.
    */
-  async resetRateLimit(recipientId, channel = "PUSH") {
-    const key = `ratelimit:${channel}:${recipientId}`;
+  async resetRateLimit(recipientId, channel = "PUSH", tenantId = "default") {
+    const key = `tenant:${tenantId}:ratelimit:${channel}:${recipientId}`;
     return await redisHelper.safeDel(key);
   }
 }

@@ -4,6 +4,12 @@ const { Schema } = mongoose;
 const { RECIPIENT_ROLES } = require('../constants/notificationConstants');
 
 const userSchema = new Schema({
+  tenantId: {
+    type: String,
+    default: "default",
+    trim: true,
+    index: true,
+  },
   fullName: {
     type: String,
     required: [true, "Full name is required"],
@@ -91,9 +97,10 @@ const userSchema = new Schema({
 });
 
 /**
- * 2dsphere Index
+ * Indexes
  */
 userSchema.index({ currentLocation: '2dsphere' });
+userSchema.index({ tenantId: 1, email: 1 });
 
 userSchema.pre('save', async function (next) {
   if (!this.isModified('password')) return next();

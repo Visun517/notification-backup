@@ -16,6 +16,8 @@ const {
   getUnreadCount,
   markAllAsRead,
   clearAllNotifications,
+  getHealth,
+  getMetrics,
 } = require("../controllers/notificationController");
 
 // Import the testing/simulation controller
@@ -24,7 +26,13 @@ const { triggerSimulation } = require("../controllers/exampleController");
 // Import JWT authentication middleware
 const protect = require("../middleware/authMiddleware");
 
-// Enforce JWT authentication on all notification routes
+/**
+ * Public Telemetry & Health Monitoring Probes
+ */
+router.get("/health", getHealth);
+router.get("/metrics", getMetrics);
+
+// Enforce JWT authentication on remaining user notification routes
 router.use(protect);
 
 /**

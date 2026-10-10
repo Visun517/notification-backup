@@ -1,4 +1,4 @@
-const { sendNotification } = require("../services/notificationService");
+const { sendNotification } = require("../services/NotificationService");
 const catchAsync = require("../utils/catchAsync");
 const AppError = require("../errors/appError");
 const logger = require("../utils/logger");

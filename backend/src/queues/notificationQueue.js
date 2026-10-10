@@ -85,8 +85,10 @@ const deadLetterQueue = new Queue("notification-dlq", {
 async function enqueueNotification(notification, options = {}) {
   const notifId = notification._id ? notification._id.toString() : notification.id;
   const priority = notification.priority || "normal";
+  const tenantId = notification.tenantId || options.tenantId || "default";
 
   const jobData = {
+    tenantId,
     notificationId: notifId,
     payload: notification.toObject ? notification.toObject() : notification,
     recipientMeta: options.recipientMeta || {},
@@ -101,10 +103,19 @@ async function enqueueNotification(notification, options = {}) {
       type: "exponential",
       delay: 2000,
     },
-    jobId: `notif_${notifId}_${Date.now()}`,
+    jobId: `tenant_${tenantId}_notif_${notifId}_${Date.now()}`,
   });
 
-  logger.info(`📥 [NotificationQueue] Enqueued notification ${notifId} to queue (Job ID: ${job.id}, Priority: ${priority})`);
+  try {
+    const { telemetry } = require("../utils/telemetry");
+    telemetry.recordEnqueued({
+      tenantId,
+      channels: notification.channels,
+      priority,
+    });
+  } catch (_) {}
+
+  logger.info(`📥 [NotificationQueue] Enqueued notification ${notifId} [Tenant: ${tenantId}] (Job ID: ${job.id}, Priority: ${priority})`);
   return job;
 }
 

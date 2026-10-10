@@ -10,6 +10,14 @@ const mongoose = require("mongoose");
  */
 const readStatusSchema = new mongoose.Schema(
   {
+    // Multi-Tenancy Partitioning
+    tenantId: {
+      type: String,
+      default: "default",
+      trim: true,
+      index: true,
+    },
+
     // The ID of the public notification that was read
     notificationId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -42,16 +50,15 @@ const readStatusSchema = new mongoose.Schema(
 // --- INDEXES (For Performance & Data Integrity) ---
 
 /**
- * 1. Compound Unique Index
- * Ensures that a user cannot mark the same notification as "read" more than once.
- * It also makes the Aggregation queries (like getUnreadCount) super fast.
+ * 1. Compound Unique Index partitioned by tenant
  */
-readStatusSchema.index({ userId: 1, notificationId: 1 }, { unique: true });
+readStatusSchema.index({ tenantId: 1, userId: 1, notificationId: 1 }, { unique: true });
+readStatusSchema.index({ userId: 1, notificationId: 1 });
 
 /**
  * 2. Notification ID Index
- * Helps to quickly find and delete all read statuses if the main Notification gets deleted.
  */
+readStatusSchema.index({ tenantId: 1, notificationId: 1 });
 readStatusSchema.index({ notificationId: 1 });
 
 module.exports = mongoose.model("NotificationReadStatus", readStatusSchema);

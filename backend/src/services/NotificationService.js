@@ -49,28 +49,35 @@ const sendNotification = async (arg1, arg2 = {}) => {
       }
     }
 
-    // 2. IDEMPOTENCY GUARD (Redis SETNX with 10-minute TTL)
+    const tenantId = data.tenantId || options.tenantId || "default";
+
+    // 2. IDEMPOTENCY GUARD (Redis SETNX with 10-minute TTL, partitioned by tenantId)
     const idempotencyKey =
       data.idempotencyKey ||
       options.idempotencyKey ||
       crypto
         .createHash("sha256")
         .update(
-          `${data.recipientId || ""}:${data.scope || ""}:${data.title || ""}:${data.message || ""}:${JSON.stringify(data.tags || [])}`,
+          `${tenantId}:${data.recipientId || ""}:${data.scope || ""}:${data.title || ""}:${data.message || ""}:${JSON.stringify(data.tags || [])}`,
         )
         .digest("hex");
 
-    const idempotencyRedisKey = `notif:idempotency:${idempotencyKey}`;
+    const idempotencyRedisKey = `tenant:${tenantId}:notif:idempotency:${idempotencyKey}`;
+    const legacyIdempotencyKey = `notif:idempotency:${idempotencyKey}`;
     const isUnique = await redisHelper.safeSetNx(idempotencyRedisKey, "PENDING", 600); // 10 minutes
+    if (tenantId === "default") {
+      await redisHelper.safeSetNx(legacyIdempotencyKey, "PENDING", 600);
+    }
 
     if (!isUnique) {
       logger.warn(
-        `⚠️ [NotificationService] Duplicate dispatch blocked by Idempotency Guard: ${idempotencyKey}`,
+        `⚠️ [NotificationService] Duplicate dispatch blocked by Idempotency Guard: Tenant=${tenantId}, Key=${idempotencyKey}`,
       );
       return {
         deduplicated: true,
         message: "Duplicate notification suppressed by idempotency guard",
         idempotencyKey,
+        tenantId,
       };
     }
 
@@ -88,10 +95,14 @@ const sendNotification = async (arg1, arg2 = {}) => {
       : [NOTIFICATION_CHANNELS.IN_APP];
 
     if (processedData.recipientId) {
-      const prefKey = `user:${processedData.recipientId}:preferences`;
+      const prefKey = `tenant:${tenantId}:user:${processedData.recipientId}:preferences`;
+      const legacyPrefKey = `user:${processedData.recipientId}:preferences`;
       let preferences = null;
 
-      const cachedPref = await redisHelper.safeGet(prefKey);
+      let cachedPref = await redisHelper.safeGet(prefKey);
+      if (!cachedPref && tenantId === "default") {
+        cachedPref = await redisHelper.safeGet(legacyPrefKey);
+      }
       if (cachedPref) {
         try {
           preferences = typeof cachedPref === "string" ? JSON.parse(cachedPref) : cachedPref;
@@ -119,6 +130,9 @@ const sendNotification = async (arg1, arg2 = {}) => {
           preferences = { channels: Object.fromEntries(preferences.channels) };
         }
         await redisHelper.safeSet(prefKey, preferences, 86400); // 24-hour TTL
+        if (tenantId === "default") {
+          await redisHelper.safeSet(legacyPrefKey, preferences, 86400);
+        }
       }
 
       // Filter target channels based on user preferences
@@ -127,7 +141,7 @@ const sendNotification = async (arg1, arg2 = {}) => {
         targetChannels = targetChannels.filter((channel) => {
           if (prefChannels[channel] === false) {
             logger.info(
-              `🚫 [NotificationService] Channel '${channel}' filtered out by user preference for User ${processedData.recipientId}`,
+              `🚫 [NotificationService] Channel '${channel}' filtered out by user preference for User ${processedData.recipientId} (Tenant: ${tenantId})`,
             );
             return false;
           }
@@ -136,21 +150,28 @@ const sendNotification = async (arg1, arg2 = {}) => {
       }
     }
 
-    // 5. Persist notification to database with initial status 'QUEUED'
+    // 5. Persist notification to database with initial status 'QUEUED' and tenantId
     const newNotification = await Notification.create({
       ...processedData,
+      tenantId,
       channels: targetChannels,
       status: NOTIFICATION_STATUSES.QUEUED,
     });
-    logger.info(`💾 Notification saved to DB as QUEUED: ${newNotification._id}`);
+    logger.info(`💾 Notification saved to DB as QUEUED: ${newNotification._id} [Tenant: ${tenantId}]`);
 
     // Update idempotency key with generated notification ID
     await redisHelper.safeSet(idempotencyRedisKey, newNotification._id.toString(), 600);
+    if (tenantId === "default") {
+      await redisHelper.safeSet(legacyIdempotencyKey, newNotification._id.toString(), 600);
+    }
 
-    // 6. CACHE-ASIDE: ATOMIC UNREAD COUNT INCREMENT
+    // 6. CACHE-ASIDE: ATOMIC UNREAD COUNT INCREMENT (partitioned by tenantId)
     if (newNotification.scope === "UNICAST" && newNotification.recipientId) {
-      const countKey = `user:${newNotification.recipientId}:unread_count`;
+      const countKey = `tenant:${tenantId}:user:${newNotification.recipientId}:unread_count`;
       await redisHelper.safeIncr(countKey);
+      if (tenantId === "default") {
+        await redisHelper.safeIncr(`user:${newNotification.recipientId}:unread_count`);
+      }
     }
 
     // 7. ENQUEUE INTO ASYNCHRONOUS BULLMQ PIPELINE
@@ -158,6 +179,7 @@ const sendNotification = async (arg1, arg2 = {}) => {
     try {
       const enqueueFn = options.enqueueNotification || queueHelper.enqueueNotification;
       job = await enqueueFn(newNotification, {
+        tenantId,
         recipientMeta: {
           io,
           ...options.recipientMeta,

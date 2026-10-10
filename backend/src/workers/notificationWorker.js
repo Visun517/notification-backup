@@ -33,8 +33,17 @@ workerConnection.on("error", (err) => {
  */
 async function processNotificationJob(job) {
   const { notificationId, payload, recipientMeta } = job.data;
+  const tenantId = job.data.tenantId || payload.tenantId || "default";
 
-  logger.info(`⚙️ [NotificationWorker] Processing Job ${job.id} for Notification: ${notificationId} (Attempt: ${job.attemptsMade + 1})`);
+  // Measure Queue Wait Duration
+  const enqueuedAt = job.data.enqueuedAt ? new Date(job.data.enqueuedAt).getTime() : null;
+  const queueWaitMs = enqueuedAt ? Math.max(0, Date.now() - enqueuedAt) : 0;
+  try {
+    const { telemetry } = require("../utils/telemetry");
+    telemetry.recordQueueWaitTime({ tenantId, durationMs: queueWaitMs });
+  } catch (_) {}
+
+  logger.info(`⚙️ [NotificationWorker] Processing Job ${job.id} [Tenant: ${tenantId}] for Notification: ${notificationId} (Attempt: ${job.attemptsMade + 1})`);
 
   // 1. Update status in Database to PROCESSING
   if (notificationId) {
@@ -57,14 +66,15 @@ async function processNotificationJob(job) {
 
   // 2. Iterate through target channels and execute deliveries
   for (const channel of targetChannels) {
-    // A. Apply Rate Limiting / Frequency Capping for Push notifications
+    // A. Apply Rate Limiting / Frequency Capping for Push notifications (partitioned by tenantId)
     if (channel === "PUSH" && payload.recipientId) {
       const rateCheck = await checkRateLimit(payload.recipientId, "PUSH", {
+        tenantId,
         priority: payload.priority,
       });
 
       if (!rateCheck.allowed) {
-        logger.warn(`⏳ [NotificationWorker] PUSH rate limit exceeded for User ${payload.recipientId}. Skipping PUSH delivery.`);
+        logger.warn(`⏳ [NotificationWorker] PUSH rate limit exceeded for Tenant ${tenantId}, User ${payload.recipientId}. Skipping PUSH delivery.`);
         dispatchResults.push({
           channel,
           success: false,
@@ -81,6 +91,16 @@ async function processNotificationJob(job) {
       logger.warn(`⚠️ [NotificationWorker] Provider not found for channel '${channel}'. Skipping.`);
       dispatchResults.push({ channel, success: false, reason: "Provider not registered" });
       failureCount++;
+      try {
+        const { telemetry } = require("../utils/telemetry");
+        telemetry.recordDispatch({
+          tenantId,
+          channel,
+          durationMs: 0,
+          success: false,
+          reason: "Provider not registered",
+        });
+      } catch (_) {}
       continue;
     }
 
@@ -88,22 +108,55 @@ async function processNotificationJob(job) {
       logger.warn(`⚠️ [NotificationWorker] Provider for channel '${channel}' is not configured. Skipping.`);
       dispatchResults.push({ channel, success: false, reason: "Provider not configured" });
       failureCount++;
+      try {
+        const { telemetry } = require("../utils/telemetry");
+        telemetry.recordDispatch({
+          tenantId,
+          channel,
+          durationMs: 0,
+          success: false,
+          reason: "Provider not configured",
+        });
+      } catch (_) {}
       continue;
     }
 
-    // C. Deliver via Provider
+    // C. Deliver via Provider with Dispatch Latency Telemetry
+    const sendStart = Date.now();
     try {
       const result = await provider.send(payload, recipientMeta || {});
+      const sendDurationMs = Date.now() - sendStart;
       dispatchResults.push(result);
       if (result.success) {
         successCount++;
       } else {
         failureCount++;
       }
+      try {
+        const { telemetry } = require("../utils/telemetry");
+        telemetry.recordDispatch({
+          tenantId,
+          channel,
+          durationMs: sendDurationMs,
+          success: !!result.success,
+          reason: result.reason || result.error,
+        });
+      } catch (_) {}
     } catch (err) {
+      const sendDurationMs = Date.now() - sendStart;
       logger.error(`❌ [NotificationWorker] Delivery error on channel '${channel}': ${err.message}`);
       dispatchResults.push({ channel, success: false, error: err.message });
       failureCount++;
+      try {
+        const { telemetry } = require("../utils/telemetry");
+        telemetry.recordDispatch({
+          tenantId,
+          channel,
+          durationMs: sendDurationMs,
+          success: false,
+          reason: err.message,
+        });
+      } catch (_) {}
     }
   }
 
@@ -173,6 +226,7 @@ function startNotificationWorker() {
       logger.error(`🚨 [NotificationWorker] Job ${job.id} exceeded maximum retries. Routing to Dead-Letter Queue.`);
 
       const { notificationId, payload } = job.data;
+      const tenantId = job.data.tenantId || payload.tenantId || "default";
 
       // Update database status to FAILED with failure metadata
       if (notificationId) {
@@ -181,6 +235,7 @@ function startNotificationWorker() {
             status: NOTIFICATION_STATUSES.FAILED,
             metadata: {
               ...(payload.metadata || {}),
+              tenantId,
               failureReason: err.message,
               failedAt: new Date(),
               attempts: job.attemptsMade,
@@ -195,13 +250,14 @@ function startNotificationWorker() {
       try {
         await deadLetterQueue.add("dead-letter-job", {
           originalJobId: job.id,
+          tenantId,
           notificationId,
           payload,
           failedReason: err.message,
           failedAt: new Date().toISOString(),
           attemptsMade: job.attemptsMade,
         });
-        logger.info(`📦 [NotificationWorker] Job ${job.id} successfully queued into notification-dlq.`);
+        logger.info(`📦 [NotificationWorker] Job ${job.id} [Tenant: ${tenantId}] successfully queued into notification-dlq.`);
       } catch (dlqErr) {
         logger.error(`❌ [NotificationWorker] Failed to write to DLQ: ${dlqErr.message}`);
       }

@@ -9,6 +9,14 @@ const {
 
 const notificationSchema = new Schema(
   {
+    // Multi-Tenancy Partitioning
+    tenantId: {
+      type: String,
+      default: "default",
+      trim: true,
+      index: true,
+    },
+
     // 1. Target Audience & Scope
     scope: {
       type: String,
@@ -111,7 +119,14 @@ const notificationSchema = new Schema(
 // 1. Geospatial index
 notificationSchema.index({ location: "2dsphere" }, { sparse: true });
 
-// 2. Query indexes for feed loading
+// 2. Multi-tenant compound query indexes for feed loading & filtering
+notificationSchema.index({ tenantId: 1, recipientId: 1, createdAt: -1 });
+notificationSchema.index({ tenantId: 1, tags: 1, createdAt: -1 });
+notificationSchema.index({ tenantId: 1, scope: 1, createdAt: -1 });
+notificationSchema.index({ tenantId: 1, status: 1 });
+notificationSchema.index({ tenantId: 1, channels: 1 });
+
+// Query indexes for feed loading (backward compatibility)
 notificationSchema.index({ recipientId: 1, createdAt: -1 });
 notificationSchema.index({ tags: 1, createdAt: -1 });
 notificationSchema.index({ scope: 1, createdAt: -1 });
