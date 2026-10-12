@@ -142,17 +142,28 @@ async function safeIncr(key) {
 }
 
 /**
- * Safe Atomic DECR (with non-negative floor)
+ * Safe Atomic DECR (with non-negative floor) — Atomic Lua implementation.
+ * Uses a Lua script to atomically decrement and clamp to 0 in a single
+ * Redis round-trip, preventing race conditions where two concurrent
+ * callers both see a negative value and both reset to zero.
  */
+const SAFE_DECR_SCRIPT = `
+  local v = redis.call('DECR', KEYS[1])
+  if v < 0 then
+    redis.call('SET', KEYS[1], '0')
+    return 0
+  end
+  return v
+`;
+
 async function safeDecr(key) {
   if (!isRedisConnected()) return null;
   try {
-    const val = await redisClient.decr(key);
-    if (val < 0) {
-      await redisClient.set(key, "0");
-      return 0;
-    }
-    return val;
+    const result = await redisClient.eval(SAFE_DECR_SCRIPT, {
+      keys: [key],
+      arguments: [],
+    });
+    return Number(result);
   } catch (err) {
     logger.error(`[Redis] safeDecr error for key '${key}': ${err.message}`);
     return null;
@@ -173,6 +184,29 @@ async function safeDel(key) {
   }
 }
 
+/**
+ * Safe Eval — executes an arbitrary Lua script atomically on the Redis server.
+ * Used by rate limiters and other components that require compound atomic operations.
+ *
+ * @param {string} script   - Lua script source
+ * @param {string[]} keys   - KEYS[] array passed to the script
+ * @param {string[]} args   - ARGV[] array passed to the script
+ * @returns {Promise<any>}  - Script return value, or null on error/disconnect
+ */
+async function safeEvalScript(script, keys = [], args = []) {
+  if (!isRedisConnected()) return null;
+  try {
+    const result = await redisClient.eval(script, {
+      keys,
+      arguments: args.map(String),
+    });
+    return result;
+  } catch (err) {
+    logger.error(`[Redis] safeEvalScript error: ${err.message}`);
+    return null;
+  }
+}
+
 module.exports = {
   redisClient,
   pubClient,
@@ -185,4 +219,5 @@ module.exports = {
   safeIncr,
   safeDecr,
   safeDel,
+  safeEvalScript,
 };

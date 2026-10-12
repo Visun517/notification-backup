@@ -166,11 +166,23 @@ const sendNotification = async (arg1, arg2 = {}) => {
     }
 
     // 6. CACHE-ASIDE: ATOMIC UNREAD COUNT INCREMENT (partitioned by tenantId)
+    // Only UNICAST notifications contribute to the per-user unread counter.
+    // BROADCAST/MULTICAST messages use the NotificationReadStatus table instead.
+    // TTL of 7 days prevents counter keys from living forever if never read.
     if (newNotification.scope === "UNICAST" && newNotification.recipientId) {
+      const UNREAD_INCR_SCRIPT = `
+        local v = redis.call('INCR', KEYS[1])
+        if v == 1 then
+          redis.call('EXPIRE', KEYS[1], ARGV[1])
+        end
+        return v
+      `;
+      const TTL_7_DAYS = 7 * 24 * 3600;
       const countKey = `tenant:${tenantId}:user:${newNotification.recipientId}:unread_count`;
-      await redisHelper.safeIncr(countKey);
+      await redisHelper.safeEvalScript(UNREAD_INCR_SCRIPT, [countKey], [TTL_7_DAYS]);
       if (tenantId === "default") {
-        await redisHelper.safeIncr(`user:${newNotification.recipientId}:unread_count`);
+        const legacyKey = `user:${newNotification.recipientId}:unread_count`;
+        await redisHelper.safeEvalScript(UNREAD_INCR_SCRIPT, [legacyKey], [TTL_7_DAYS]);
       }
     }
 

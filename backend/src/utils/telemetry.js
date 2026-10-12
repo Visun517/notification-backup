@@ -120,14 +120,15 @@ class TelemetryService {
     for (const [name, dataMap] of this.histograms.entries()) {
       output += `# HELP ${name} Latency distribution for ${name}\n`;
       output += `# TYPE ${name} histogram\n`;
-      for (const [labelKey, hist] of dataMap.entries()) {
+    for (const [labelKey, hist] of dataMap.entries()) {
+        const labelsStr = labelKey ? `{${labelKey}}` : "";
         const prefix = labelKey ? `${labelKey},` : "";
         for (const b of hist.buckets) {
           output += `${name}_bucket{${prefix}le="${b.le}"} ${b.count}\n`;
         }
         output += `${name}_bucket{${prefix}le="+Inf"} ${hist.infCount}\n`;
-        output += `${name}_sum{${labelKey ? "{" + labelKey + "}" : ""}} ${hist.sum}\n`;
-        output += `${name}_count{${labelKey ? "{" + labelKey + "}" : ""}} ${hist.count}\n`;
+        output += `${name}_sum${labelsStr} ${hist.sum}\n`;
+        output += `${name}_count${labelsStr} ${hist.count}\n`;
       }
     }
 

@@ -174,11 +174,13 @@ async function processNotificationJob(job) {
   if (notificationId) {
     try {
       await Notification.findByIdAndUpdate(notificationId, {
-        status: finalStatus,
-        metadata: {
-          ...(payload.metadata || {}),
-          dispatchResults,
-          processedAt: new Date(),
+        $set: {
+          status: finalStatus,
+          // Use dotted-path notation to MERGE into metadata rather than
+          // replacing the entire subdocument — preserves any custom fields
+          // that were set at creation time (e.g. metadata.customField).
+          "metadata.dispatchResults": dispatchResults,
+          "metadata.processedAt": new Date(),
         },
       });
     } catch (err) {
@@ -232,13 +234,13 @@ function startNotificationWorker() {
       if (notificationId) {
         try {
           await Notification.findByIdAndUpdate(notificationId, {
-            status: NOTIFICATION_STATUSES.FAILED,
-            metadata: {
-              ...(payload.metadata || {}),
-              tenantId,
-              failureReason: err.message,
-              failedAt: new Date(),
-              attempts: job.attemptsMade,
+            $set: {
+              status: NOTIFICATION_STATUSES.FAILED,
+              // Dotted-path $set preserves any other existing metadata fields
+              "metadata.tenantId": tenantId,
+              "metadata.failureReason": err.message,
+              "metadata.failedAt": new Date(),
+              "metadata.attempts": job.attemptsMade,
             },
           });
         } catch (dbErr) {
@@ -283,5 +285,10 @@ module.exports = {
   startNotificationWorker,
   stopNotificationWorker,
   processNotificationJob,
-  notificationWorker,
+  // Getter instead of primitive snapshot: ensures callers always receive
+  // the live worker instance even after startNotificationWorker() has run,
+  // since the module-level `notificationWorker` variable starts as null.
+  get notificationWorker() {
+    return notificationWorker;
+  },
 };

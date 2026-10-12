@@ -2,6 +2,21 @@ const redisHelper = require("../config/redisClient");
 const logger = require("./logger");
 
 /**
+ * Atomic Lua script: INCR key and set TTL only on first increment.
+ * Runs as a single atomic unit on the Redis server, eliminating the
+ * TOCTOU race condition between INCR and EXPIRE.
+ *
+ * Returns the new counter value after increment.
+ */
+const RATE_LIMIT_INCR_SCRIPT = `
+  local count = redis.call('INCR', KEYS[1])
+  if count == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+  end
+  return count
+`;
+
+/**
  * Enterprise Rate Limiter & Frequency Capper.
  * Prevents recipient alert fatigue using Redis atomic sliding-window / counters.
  * Default policy: Max 5 push notifications per recipient within a 10-minute window.
@@ -45,12 +60,18 @@ class RateLimiter {
     const key = `tenant:${tenantId}:ratelimit:${channel}:${recipientId}`;
 
     try {
-      // Atomic increment
-      const count = await redisHelper.safeIncr(key);
+      // Atomic Lua script: INCR + conditional EXPIRE in a single round-trip.
+      // Eliminates the TOCTOU race between INCR and EXPIRE that could produce
+      // immortal keys under concurrent load.
+      const count = await redisHelper.safeEvalScript(
+        RATE_LIMIT_INCR_SCRIPT,
+        [key],
+        [windowSeconds],
+      );
 
-      // If key was just created (count === 1), set expiration TTL
-      if (count === 1) {
-        await redisHelper.safeSet(key, 1, windowSeconds);
+      // If Redis is unavailable, safeEvalScript returns null — fail-open
+      if (count === null) {
+        return { allowed: true, currentCount: 0, limit: maxRequests, fallback: true };
       }
 
       if (count > maxRequests) {

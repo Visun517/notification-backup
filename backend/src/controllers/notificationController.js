@@ -170,6 +170,14 @@ const markAsRead = catchAsync(async (req, res, next) => {
     }
     notification.isRead = true;
     await notification.save();
+
+    // Decrement cached unread count ONLY for UNICAST — this is the only scope
+    // that increments the counter at creation time. Decrementing for BROADCAST
+    // would produce a negative cached count.
+    await redisHelper.safeDecr(`tenant:${tenantId}:user:${userId}:unread_count`);
+    if (tenantId === "default") {
+      await redisHelper.safeDecr(`user:${userId}:unread_count`);
+    }
   } else {
     // If it's a public message, add or update a record in NotificationReadStatus
     await NotificationReadStatus.updateOne(
@@ -177,12 +185,6 @@ const markAsRead = catchAsync(async (req, res, next) => {
       { $setOnInsert: { readAt: new Date() } },
       { upsert: true },
     );
-  }
-
-  // Decrement cached unread count atomically in Redis (partitioned by tenantId)
-  await redisHelper.safeDecr(`tenant:${tenantId}:user:${userId}:unread_count`);
-  if (tenantId === "default") {
-    await redisHelper.safeDecr(`user:${userId}:unread_count`);
   }
 
   logger.info(`Notification ${id} marked as read by User ${userId} [Tenant: ${tenantId}]`);
