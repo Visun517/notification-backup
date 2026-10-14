@@ -222,7 +222,7 @@ const sendNotification = async (arg1, arg2 = {}) => {
     const resultObj = newNotification.toObject ? newNotification.toObject() : { ...newNotification };
     return {
       ...resultObj,
-      queued: true,
+      queued: true, 
       jobId: job ? job.id : null,
     };
   } catch (error) {
