@@ -22,7 +22,7 @@ const { notificationQueue, deadLetterQueue, enqueueNotification } = require("./q
 const { startNotificationWorker, stopNotificationWorker } = require("./workers/notificationWorker");
 const Notification = require("./models/Notification");
 const NotificationReadStatus = require("./models/NotificationReadStatus");
-const User = require("./models/User");
+const NotificationProfile = require("./models/NotificationProfile");
 const notificationRoutes = require("./routes/notificationRoutes");
 const {
   NOTIFICATION_CHANNELS,
@@ -67,7 +67,7 @@ module.exports = {
   // Mongoose Models
   Notification,
   NotificationReadStatus,
-  User,
+  NotificationProfile,
 
   // Constants
   NOTIFICATION_CHANNELS,

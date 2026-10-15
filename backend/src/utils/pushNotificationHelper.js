@@ -1,5 +1,5 @@
 const { getMessaging } = require('firebase-admin/messaging');
-const User = require('../models/User'); // Required to clean up invalid tokens from the database
+const NotificationProfile = require('../models/NotificationProfile'); // Self-healing: removes stale FCM tokens
 const logger = require('./logger');
 
 /**
@@ -55,7 +55,12 @@ const sendPushNotification = async (target, title, body, data = {}) => {
         ` Stale FCM Token Detected. Removing from DB: ${target.slice(0, 20)}...`
       );
 
-      await User.updateOne({ fcmToken: target }, { $set: { fcmToken: null } });
+      // Remove the stale token from the NotificationProfile fcmTokens array.
+      // Uses $pull for atomic array element removal across all matching profiles.
+      await NotificationProfile.updateMany(
+        { fcmTokens: target },
+        { $pull: { fcmTokens: target } },
+      );
     }
 
     // Log the exact error for debugging

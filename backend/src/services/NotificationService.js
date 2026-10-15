@@ -1,7 +1,7 @@
 const mongoose = require("mongoose");
 const crypto = require("crypto");
 const Notification = require("../models/Notification");
-const User = require("../models/User");
+const NotificationProfile = require("../models/NotificationProfile");
 const AppError = require("../errors/appError");
 const logger = require("../utils/logger");
 const { templateEngine } = require("../utils/TemplateEngine");
@@ -113,21 +113,34 @@ const sendNotification = async (arg1, arg2 = {}) => {
 
       if (!preferences) {
         try {
-          const user = await User.findById(processedData.recipientId).select("notificationPreferences");
-          if (user && user.notificationPreferences) {
-            preferences = user.notificationPreferences;
+          // Query the engine's own decoupled NotificationProfile instead of the
+          // host app's User model, breaking the tight coupling.
+          const profile = await NotificationProfile.findOne({
+            userId: String(processedData.recipientId),
+            tenantId,
+          }).select("preferences");
+
+          if (profile && profile.preferences) {
+            // Remap flat profile keys (email/push/sms/in_app) to engine channel constants
+            const p = profile.preferences;
+            preferences = {
+              channels: {
+                IN_APP:  p.in_app  !== false,
+                PUSH:    p.push    !== false,
+                EMAIL:   p.email   !== false,
+                SMS:     p.sms     !== false,
+                WEBHOOK: true, // WEBHOOK has no preference field — defaults on
+              },
+            };
           }
         } catch (dbErr) {
-          logger.debug(`User preferences query bypassed: ${dbErr.message}`);
+          logger.debug(`NotificationProfile preferences query bypassed: ${dbErr.message}`);
         }
 
         if (!preferences) {
           preferences = {
             channels: { IN_APP: true, PUSH: true, EMAIL: true, SMS: true, WEBHOOK: true },
           };
-        }
-        if (preferences.channels instanceof Map) {
-          preferences = { channels: Object.fromEntries(preferences.channels) };
         }
         await redisHelper.safeSet(prefKey, preferences, 86400); // 24-hour TTL
         if (tenantId === "default") {

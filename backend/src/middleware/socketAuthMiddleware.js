@@ -1,11 +1,14 @@
 const jwt = require("jsonwebtoken");
-const User = require("../models/User");
 const logger = require("../utils/logger");
 
 /**
  * Socket Authentication Middleware.
- * This function cryptographically verifies the JWT token of connecting clients
+ * Cryptographically verifies the JWT token of connecting clients
  * and binds authenticated user details to the socket instance.
+ *
+ * DECOUPLED: No longer queries the host app's User model.
+ * Identity is fully asserted by the JWT payload — the host application
+ * is responsible for issuing valid tokens.
  */
 const socketAuth = async (socket, next) => {
   try {
@@ -60,7 +63,7 @@ const socketAuth = async (socket, next) => {
       return next(new Error("Authentication error: Verification failed"));
     }
 
-    // Extract user ID from verified payload
+    // 3. Extract user identity from the verified JWT payload
     const userId = decoded.id || decoded._id || decoded.userId || decoded.sub;
 
     if (!userId) {
@@ -70,21 +73,15 @@ const socketAuth = async (socket, next) => {
       return next(new Error("Authentication error: Invalid token structure"));
     }
 
-    // 3. Find the user in the database to ensure they still exist and get their role
-    const user = await User.findById(userId).select("role");
-
-    if (!user) {
-      logger.warn(`Socket Auth Failed: User not found in DB. ID: ${userId}`);
-      return next(new Error("Authentication error: User not found"));
-    }
-
-    // 4. Attach the verified user details to the socket object
-    socket.userId = user._id.toString();
-    socket.userRole = user.role;
+    // 4. Attach the verified identity to the socket.
+    //    No DB lookup — the JWT signature is the source of truth.
+    socket.userId = String(userId);
+    socket.userRole = decoded.role || null;
+    socket.tenantId = decoded.tenantId || "default";
 
     // Log the successful connection
     logger.info(
-      `🔒 Socket Authenticated: User ${socket.userId} (${socket.userRole})`,
+      `🔒 Socket Authenticated: User ${socket.userId} (${socket.userRole ?? "no-role"})`,
     );
 
     // Allow the connection to proceed

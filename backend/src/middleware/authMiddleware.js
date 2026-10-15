@@ -1,12 +1,16 @@
 const jwt = require("jsonwebtoken");
-const User = require("../models/User");
 const AppError = require("../errors/appError");
 const catchAsync = require("../utils/catchAsync");
 const logger = require("../utils/logger");
 
 /**
  * HTTP Authentication Middleware (Protect).
- * Cryptographically verifies JWT from Authorization header and attaches the authenticated user to req.user.
+ * Cryptographically verifies the JWT from the Authorization header and
+ * attaches the decoded user identity to req.user.
+ *
+ * DECOUPLED: The engine no longer holds a User model. Identity is fully
+ * asserted by the JWT token issued by the host application. No DB lookup
+ * is performed here — the token signature is the source of truth.
  */
 const protect = catchAsync(async (req, res, next) => {
   let token;
@@ -35,7 +39,7 @@ const protect = catchAsync(async (req, res, next) => {
     return next(new AppError("Server authentication configuration error", 500));
   }
 
-  // 2. Verify token
+  // 2. Verify token signature and expiration
   let decoded;
   try {
     decoded = jwt.verify(token, secret);
@@ -49,22 +53,20 @@ const protect = catchAsync(async (req, res, next) => {
     return next(new AppError("Token verification failed", 401));
   }
 
-  // 3. Extract user ID and verify that user still exists
+  // 3. Extract user identity from the verified JWT payload
   const userId = decoded.id || decoded._id || decoded.userId || decoded.sub;
   if (!userId) {
     return next(new AppError("Invalid token payload: user identifier missing.", 401));
   }
 
-  const currentUser = await User.findById(userId);
-  if (!currentUser) {
-    return next(
-      new AppError("The user belonging to this token no longer exists.", 401),
-    );
-  }
-
-  // 4. Attach verified user to request
-  req.user = currentUser;
-  req.userId = (currentUser._id ? currentUser._id.toString() : String(userId));
+  // 4. Attach the verified identity to the request
+  //    The host app's JWT is the source of truth — no DB round-trip needed.
+  req.user = {
+    id: String(userId),
+    role: decoded.role || null,
+    tenantId: decoded.tenantId || req.headers["x-tenant-id"] || "default",
+  };
+  req.userId = String(userId);
 
   next();
 });

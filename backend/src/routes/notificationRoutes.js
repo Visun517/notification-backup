@@ -23,6 +23,13 @@ const {
 // Import the testing/simulation controller
 const { triggerSimulation } = require("../controllers/exampleController");
 
+// Import the decoupled Subscription Registry (profile) controller
+const {
+  addDeviceToken,
+  removeDeviceToken,
+  updatePreferences,
+} = require("../controllers/profileController");
+
 // Import JWT authentication middleware
 const protect = require("../middleware/authMiddleware");
 
@@ -70,5 +77,28 @@ router.delete("/clear-all-notifications", clearAllNotifications);
  * Description: Testing route to simulate notification events.
  */
 router.post("/simulate-system-update", triggerSimulation);
+
+/**
+ * Subscription Registry — Notification Profile Management.
+ *
+ * These routes manage the engine's decoupled NotificationProfile,
+ * replacing the previous tight coupling to the host app's User model.
+ *
+ * Route: PATCH /profile/:userId/token
+ * Description: Registers a new FCM device token for the user (idempotent via $addToSet).
+ */
+router.patch("/profile/:userId/token", addDeviceToken);
+
+/**
+ * Route: DELETE /profile/:userId/token
+ * Description: Removes a specific FCM token from the user's device list (e.g. on logout).
+ */
+router.delete("/profile/:userId/token", removeDeviceToken);
+
+/**
+ * Route: PATCH /profile/:userId/preferences
+ * Description: Updates the user's per-channel notification preferences.
+ */
+router.patch("/profile/:userId/preferences", updatePreferences);
 
 module.exports = router;

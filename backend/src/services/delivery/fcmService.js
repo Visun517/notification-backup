@@ -1,8 +1,9 @@
 const { getMessaging } = require("firebase-admin/messaging");
 const logger = require("../../utils/logger");
 
-// Import the User model to remove invalid tokens from the database
-const User = require("../../models/User"); 
+// Import NotificationProfile to remove invalid tokens from the engine's registry
+const NotificationProfile = require("../../models/NotificationProfile");
+
 
 // Helper function to remove spaces and special characters from topic names
 const sanitize = (name) => (name ? name.replace(/[^a-zA-Z0-9-_.~%]/g, "") : "");
@@ -85,10 +86,11 @@ exports.manageRegionalTopics = async (
 
     // 6. If the token is dead, remove it from the database ONCE to save server resources
     if (isTokenInvalid) {
-      logger.warn(`Invalid FCM Token detected. Removing from Database...`);
-      await User.updateMany(
-        { fcmToken: fcmToken },
-        { $set: { fcmToken: null } }
+      logger.warn(`Invalid FCM Token detected. Removing from NotificationProfile registry...`);
+      // $pull removes the stale token from every profile's fcmTokens array atomically
+      await NotificationProfile.updateMany(
+        { fcmTokens: fcmToken },
+        { $pull: { fcmTokens: fcmToken } },
       );
     }
 

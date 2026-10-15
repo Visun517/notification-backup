@@ -11,43 +11,6 @@ const seedRegions = require("./src/utils/dbSeeder");
 const socketAuth = require("./src/middleware/socketAuthMiddleware");
 const cors = require("cors");
 
-/**
- * Enterprise-grade CORS allowlist.
- * Reads CORS_ORIGIN from the environment as a comma-separated string and
- * parses it into an array of allowed origins.
- *
- * Examples:
- *   CORS_ORIGIN=https://app.example.com
- *   CORS_ORIGIN=https://app.example.com,https://admin.example.com
- *
- * Falls back to ['http://localhost:5173'] when the variable is absent so
- * local development works without any .env configuration.
- */
-const ALLOWED_ORIGINS = process.env.CORS_ORIGIN
-  ? process.env.CORS_ORIGIN.split(",").map((o) => o.trim()).filter(Boolean)
-  : ["http://localhost:5173"];
-
-/**
- * CORS origin validator callback — shared by both Express cors() middleware
- * and the Socket.io server so both layers enforce the same policy.
- *
- * Rules:
- *  1. No origin (Postman, curl, server-to-server) → allowed.
- *  2. Origin in ALLOWED_ORIGINS → allowed.
- *  3. Anything else → rejected with a hard Error.
- */
-function corsOriginValidator(origin, callback) {
-  // Allow requests with no origin header (Postman, server-side fetches, etc.)
-  if (!origin) return callback(null, true);
-
-  if (ALLOWED_ORIGINS.includes(origin)) {
-    return callback(null, true);
-  }
-
-  return callback(new Error(`CORS policy: origin '${origin}' is not allowed.`));
-}
-const userRoutes = require("./src/routes/userRoutes");
-
 const app = express();
 const server = http.createServer(app);
 
@@ -58,9 +21,7 @@ app.use(morgan("dev"));
 
 const io = new Server(server, {
   cors: {
-    // Use the same validator as Express so Socket.io and HTTP
-    // always enforce an identical origin policy.
-    origin: corsOriginValidator,
+    origin: process.env.CORS_ORIGIN,
     methods: ["GET", "POST"],
     credentials: true,
   },
@@ -86,10 +47,7 @@ initRedis()
 
 app.use(
   cors({
-    // Dynamic allowlist: validates every browser origin against ALLOWED_ORIGINS.
-    // No-origin requests (Postman, server-to-server) are always permitted.
-    // Unauthorized origins receive HTTP 500 with a descriptive CORS error.
-    origin: corsOriginValidator,
+    origin: process.env.CORS_ORIGIN || "http://localhost:5173", // Frontend URL
     methods: ["GET", "POST", "PATCH", "PUT", "DELETE"],
     credentials: true,
   }),
@@ -144,7 +102,6 @@ app.get("/health/notifications", async (req, res) => {
 });
 
 app.use("/api/notifications", notificationRoutes);
-app.use("/api/user", userRoutes);
 
 // --- NOTIFICATION ENGINE SETUP END ---
 

@@ -1,7 +1,7 @@
 const IChannelProvider = require("./IChannelProvider");
 const { NOTIFICATION_CHANNELS } = require("../constants/notificationConstants");
 const sendPush = require("../utils/pushNotificationHelper");
-const User = require("../models/User");
+const NotificationProfile = require("../models/NotificationProfile");
 const logger = require("../utils/logger");
 
 const sanitizeTopic = (name) =>
@@ -52,8 +52,15 @@ class FcmChannelProvider extends IChannelProvider {
         let fcmToken = recipientMeta.fcmToken || payload.fcmToken;
 
         if (!fcmToken && recipientId) {
-          const user = await User.findById(recipientId).select("fcmToken");
-          fcmToken = user?.fcmToken;
+          // Look up the engine's own NotificationProfile — decoupled from User model.
+          // fcmTokens is an array; use the most recently registered token (last element)
+          // or fall back to the first available one.
+          const profile = await NotificationProfile.findOne({
+            userId: String(recipientId),
+          }).select("fcmTokens");
+          if (profile && profile.fcmTokens.length > 0) {
+            fcmToken = profile.fcmTokens[profile.fcmTokens.length - 1];
+          }
         }
 
         if (fcmToken) {
