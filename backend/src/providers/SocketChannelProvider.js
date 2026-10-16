@@ -3,8 +3,16 @@ const { NOTIFICATION_CHANNELS } = require("../constants/notificationConstants");
 const logger = require("../utils/logger");
 
 /**
- * SocketChannelProvider (Concrete Strategy for IN_APP / Real-time WebSockets).
- * Delivers real-time notifications via Socket.io rooms and broadcasts.
+ * SocketChannelProvider — Concrete Strategy for IN_APP / Real-time delivery.
+ *
+ * Delivers real-time notifications via Socket.io rooms. Routing is
+ * 100% domain-agnostic and mirrors socketDelivery.js exactly:
+ *
+ *   UNICAST   → private room  "user_<recipientId>"
+ *   MULTICAST → one "tag:<name>" room per tag in notification.tags
+ *   BROADCAST → io.emit() to every connected socket
+ *
+ * No geography, roles, regions, or districts anywhere in this file.
  */
 class SocketChannelProvider extends IChannelProvider {
   /**
@@ -32,9 +40,9 @@ class SocketChannelProvider extends IChannelProvider {
   }
 
   /**
-   * Delivers the notification to target user rooms or broadcast stream.
+   * Delivers the notification to the appropriate Socket.io room(s).
    *
-   * @param {Object} payload - Notification document/payload
+   * @param {Object} payload        - Notification document/payload
    * @param {Object} [recipientMeta] - Context containing optional { io } override
    * @returns {Promise<{ channel: string, success: boolean, targetRooms?: string[], error?: string }>}
    */
@@ -50,97 +58,64 @@ class SocketChannelProvider extends IChannelProvider {
       };
     }
 
-    const {
-      _id,
-      scope,
-      recipientId,
-      recipientRole,
-      region,
-      district,
-      tags = [],
-    } = payload;
+    const { _id, scope, recipientId, tags = [] } = payload;
 
     try {
-      // 1. UNICAST: Private room for single recipient
-      if (scope === "UNICAST") {
-        const targetRoom = `user_${recipientId}`;
-        logger.info(`🔌 [SocketChannelProvider] Emitting notification ${_id} to Room: ${targetRoom}`);
-        io.to(targetRoom).emit("new_notification", payload);
-        return {
-          channel: this.channelName,
-          success: true,
-          targetRooms: [targetRoom],
-        };
-      }
+      switch (scope) {
+        // -----------------------------------------------------------------
+        // UNICAST — private message to one specific user
+        // -----------------------------------------------------------------
+        case "UNICAST": {
+          const room = `user_${recipientId}`;
+          logger.info(`🔌 [SocketChannelProvider] UNICAST → Room "${room}" (Notif ${_id})`);
+          io.to(room).emit("new_notification", payload);
+          return { channel: this.channelName, success: true, targetRooms: [room] };
+        }
 
-      // 2. BROADCAST: Public alert to all connected sockets
-      if (scope === "BROADCAST") {
-        logger.info(`📢 [SocketChannelProvider] Broadcasting notification ${_id} to ALL clients`);
-        io.emit("new_notification", payload);
-        return {
-          channel: this.channelName,
-          success: true,
-          targetRooms: ["*"],
-        };
-      }
-
-      // 3. MULTICAST: Dynamic tag-based routing + legacy regional/role fallback
-      const targetRooms = new Set();
-
-      // Dynamic tag-based rooms (e.g. "role:driver" -> "tag_role:driver")
-      if (Array.isArray(tags)) {
-        tags.forEach((tag) => {
-          if (tag) {
-            targetRooms.add(`tag_${tag}`);
-            // Also add role-specific room if tag is role:<role>
-            if (tag.startsWith("role:")) {
-              targetRooms.add(`role_${tag.split(":")[1]}`);
-            }
+        // -----------------------------------------------------------------
+        // MULTICAST — fan-out to every "tag:<name>" room in notification.tags
+        // -----------------------------------------------------------------
+        case "MULTICAST": {
+          if (!tags.length) {
+            logger.warn(
+              `⚠️ [SocketChannelProvider] MULTICAST Notif ${_id} has no tags — no rooms targeted.`,
+            );
+            return {
+              channel: this.channelName,
+              success: false,
+              error: "No tags provided for MULTICAST delivery",
+            };
           }
-        });
+
+          const rooms = tags.map((tag) => `tag:${tag}`);
+          rooms.forEach((room) => {
+            logger.info(`🔌 [SocketChannelProvider] MULTICAST → Room "${room}" (Notif ${_id})`);
+            io.to(room).emit("new_notification", payload);
+          });
+
+          return { channel: this.channelName, success: true, targetRooms: rooms };
+        }
+
+        // -----------------------------------------------------------------
+        // BROADCAST — emit to every connected socket
+        // -----------------------------------------------------------------
+        case "BROADCAST": {
+          logger.info(`📢 [SocketChannelProvider] BROADCAST → all connected clients (Notif ${_id})`);
+          io.emit("new_notification", payload);
+          return { channel: this.channelName, success: true, targetRooms: ["*"] };
+        }
+
+        default:
+          logger.warn(`⚠️ [SocketChannelProvider] Unknown scope "${scope}" for Notif ${_id}.`);
+          return {
+            channel: this.channelName,
+            success: false,
+            error: `Unknown notification scope: ${scope}`,
+          };
       }
-
-      // Legacy regional room compatibility
-      if (region && (!recipientRole || recipientRole === "ALL")) {
-        targetRooms.add(`region_${region}`);
-      } else if (district && (!recipientRole || recipientRole === "ALL")) {
-        targetRooms.add(`district_${district}`);
-      } else if (recipientRole && region) {
-        targetRooms.add(`region_${region}_role_${recipientRole}`);
-      } else if (recipientRole && district) {
-        targetRooms.add(`district_${district}_role_${recipientRole}`);
-      } else if (recipientRole) {
-        targetRooms.add(`role_${recipientRole}`);
-      }
-
-      if (targetRooms.size === 0) {
-        logger.warn(`⚠️ [SocketChannelProvider] Target room NOT FOUND for notification ${_id}`);
-        return {
-          channel: this.channelName,
-          success: false,
-          error: "No matching target rooms resolved",
-        };
-      }
-
-      // Emit to all matching target rooms
-      const resolvedRooms = Array.from(targetRooms);
-      resolvedRooms.forEach((room) => {
-        logger.info(`🔌 [SocketChannelProvider] Emitting notification ${_id} to Room: ${room}`);
-        io.to(room).emit("new_notification", payload);
-      });
-
-      return {
-        channel: this.channelName,
-        success: true,
-        targetRooms: resolvedRooms,
-      };
     } catch (error) {
-      logger.error(`❌ [SocketChannelProvider] Delivery failure: ${error.message}`);
-      return {
-        channel: this.channelName,
-        success: false,
-        error: error.message,
-      };
+      logger.error(`❌ [SocketChannelProvider] Delivery failure for Notif ${_id}: ${error.message}`);
+      return { channel: this.channelName, success: false, error: error.message };
     }
   }
 }

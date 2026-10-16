@@ -25,13 +25,14 @@ const notificationSchema = new Schema(
       required: [true, "Notification scope is required"],
     },
 
-    // recipientId is required for private notifications (UNICAST)
+    // recipientId is required for private notifications (UNICAST).
+    // Stored as String to support any external auth system (UUID, ObjectId, Clerk, etc.)
     recipientId: {
-      type: Schema.Types.ObjectId,
-      ref: "User",
+      type: String,
       required: function () {
         return this.scope === NOTIFICATION_SCOPES.UNICAST;
       },
+      index: true,
     },
 
     // Dynamic targeting tags for multicast/segmentation (e.g., ["role:driver", "tier:gold", "region:balangoda"])
@@ -48,14 +49,16 @@ const notificationSchema = new Schema(
       default: [NOTIFICATION_CHANNELS.IN_APP],
     },
 
-    // Legacy role support (auto-migrated into tags on save)
+    // @deprecated — use tags instead (e.g. ["role:admin", "role:driver"]).
+    // Kept for backward compatibility with older payloads.
+    // The pre-save hook auto-migrates this into a "role:<value>" tag.
     recipientRole: {
       type: String,
       trim: true,
     },
 
-    // Optional sender tracking
-    senderId: { type: Schema.Types.ObjectId, ref: "User" },
+    // Optional sender tracking (string userId, not an ObjectId ref)
+    senderId: { type: String },
 
     // 2. Content
     title: { type: String, required: true, trim: true, maxlength: 200 },
@@ -80,9 +83,14 @@ const notificationSchema = new Schema(
       default: NOTIFICATION_STATUSES.QUEUED,
     },
 
-    // 3. Location Data (Spatial targeting)
-    region: { type: String, trim: true },
+    // @deprecated — use notification.tags for audience segmentation instead.
+    // e.g. tags: ["region:colombo", "district:gampaha"] replaces these fields.
+    // Kept for backward compatibility only.
+    region:   { type: String, trim: true },
     district: { type: String, trim: true },
+
+    // Optional GeoJSON point — kept for spatial indexing if needed by host app.
+    // The engine itself no longer reads this field.
     location: {
       type: { type: String, enum: ["Point"] },
       coordinates: { type: [Number] }, // [longitude, latitude]

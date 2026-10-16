@@ -4,12 +4,32 @@ const sendPush = require("../utils/pushNotificationHelper");
 const NotificationProfile = require("../models/NotificationProfile");
 const logger = require("../utils/logger");
 
-const sanitizeTopic = (name) =>
-  name ? name.replace(/[^a-zA-Z0-9-_.~%]/g, "") : "";
+/**
+ * Sanitize a tag string into a valid FCM topic component.
+ * FCM topics allow: letters, digits, hyphens, underscores, tildes, percent.
+ * Mirrors the sanitizeTag() helpers in fcmService.js and pushDelivery.js.
+ *
+ * @param {string} tag
+ * @returns {string}
+ */
+const sanitizeTag = (tag) => tag.replace(/[^a-zA-Z0-9-_.~%]/g, "_");
 
 /**
- * FcmChannelProvider (Concrete Strategy for PUSH notifications).
+ * FcmChannelProvider — Concrete Strategy for PUSH notifications.
+ *
  * Delivers mobile push notifications via Firebase Cloud Messaging (FCM).
+ * Routing is 100% domain-agnostic and mirrors FcmDelivery / socketDelivery:
+ *
+ *   UNICAST   → send to every FCM token registered for the recipient user
+ *               (all tokens fetched from NotificationProfile — multi-device)
+ *   MULTICAST → fan-out to one FCM topic per tag in notification.tags
+ *               Topic naming: "tag_<tagName>"
+ *               Users subscribe to these topics on socket connect via
+ *               notificationHandler.js → fcmService.manageTagTopics()
+ *   BROADCAST → send to the reserved "broadcast_all" FCM topic
+ *               All users auto-subscribe to this topic on socket connect
+ *
+ * No geography, roles, regions, or districts anywhere in this file.
  */
 class FcmChannelProvider extends IChannelProvider {
   constructor() {
@@ -21,136 +41,137 @@ class FcmChannelProvider extends IChannelProvider {
   }
 
   /**
-   * Delivers the notification to target user device token or topic.
+   * Delivers the notification to target device token(s) or FCM topic(s).
    *
-   * @param {Object} payload - Notification document/payload
-   * @param {Object} [recipientMeta] - Optional contextual data (fcmToken override, etc.)
-   * @returns {Promise<{ channel: string, success: boolean, messageId?: string, error?: string }>}
+   * @param {Object} payload         - Notification document/payload
+   * @param {Object} [recipientMeta] - Optional context (fcmToken override, etc.)
+   * @returns {Promise<{ channel: string, success: boolean, messageId?: string, targetTopics?: string[], error?: string }>}
    */
   async send(payload, recipientMeta = {}) {
     const {
       _id,
       scope,
       recipientId,
-      recipientRole,
-      region,
-      district,
       tags = [],
       title,
       message,
-      actionUrl,
+      actionUrl = "",
+      tenantId = "default",
     } = payload;
 
     const pushData = {
-      url: String(actionUrl || ""),
+      url: String(actionUrl),
       notificationId: String(_id || ""),
     };
 
     try {
-      // 1. UNICAST: Send directly to recipient device token
-      if (scope === "UNICAST") {
-        let fcmToken = recipientMeta.fcmToken || payload.fcmToken;
+      switch (scope) {
+        // -----------------------------------------------------------------
+        // UNICAST — send to every FCM token registered for the target user.
+        // Multi-device: all tokens from NotificationProfile are targeted.
+        // -----------------------------------------------------------------
+        case "UNICAST": {
+          // Allow override via recipientMeta (e.g. worker passes cached token)
+          let fcmTokens = recipientMeta.fcmToken ? [recipientMeta.fcmToken] : null;
 
-        if (!fcmToken && recipientId) {
-          // Look up the engine's own NotificationProfile — decoupled from User model.
-          // fcmTokens is an array; use the most recently registered token (last element)
-          // or fall back to the first available one.
-          const profile = await NotificationProfile.findOne({
-            userId: String(recipientId),
-          }).select("fcmTokens");
-          if (profile && profile.fcmTokens.length > 0) {
-            fcmToken = profile.fcmTokens[profile.fcmTokens.length - 1];
+          if (!fcmTokens) {
+            const profile = await NotificationProfile.findOne({
+              userId: String(recipientId),
+              tenantId,
+            }).select("fcmTokens");
+            fcmTokens = profile?.fcmTokens ?? [];
           }
-        }
 
-        if (fcmToken) {
-          const result = await sendPush(fcmToken, title, message, pushData);
-          if (result.success) {
-            logger.info(`📲 [FcmChannelProvider] Unicast FCM delivered to User: ${recipientId}`);
-            return {
-              channel: this.channelName,
-              success: true,
-              messageId: result.messageId,
-            };
-          } else {
+          if (!fcmTokens.length) {
+            logger.warn(
+              `⚠️ [FcmChannelProvider] UNICAST skipped: no FCM tokens for User ${recipientId} [Tenant: ${tenantId}]`,
+            );
             return {
               channel: this.channelName,
               success: false,
-              error: result.error,
+              error: "No FCM tokens registered for recipient",
             };
           }
-        } else {
-          logger.warn(`⚠️ [FcmChannelProvider] Unicast FCM skipped: No token for User ${recipientId}`);
+
+          const results = [];
+          for (const token of fcmTokens) {
+            const r = await sendPush(token, title, message, pushData);
+            results.push(r);
+          }
+
+          const anySuccess = results.some((r) => r.success);
+          logger.info(
+            `📲 [FcmChannelProvider] UNICAST → User ${recipientId} (${fcmTokens.length} device(s)) [Notif ${_id}]`,
+          );
+          return {
+            channel: this.channelName,
+            success: anySuccess,
+            messageId: results.find((r) => r.messageId)?.messageId,
+          };
+        }
+
+        // -----------------------------------------------------------------
+        // MULTICAST — fan-out to one FCM topic per tag in notification.tags.
+        // "tag_<tagName>" topics are kept in sync with socket rooms via
+        // notificationHandler → fcmService.manageTagTopics on connect.
+        // -----------------------------------------------------------------
+        case "MULTICAST": {
+          if (!tags.length) {
+            logger.warn(
+              `⚠️ [FcmChannelProvider] MULTICAST Notif ${_id} has no tags — skipping FCM delivery.`,
+            );
+            return {
+              channel: this.channelName,
+              success: false,
+              error: "No tags provided for MULTICAST delivery",
+            };
+          }
+
+          const topics = tags.map((tag) => `tag_${sanitizeTag(tag)}`);
+          const results = [];
+
+          for (const topic of topics) {
+            const r = await sendPush(topic, title, message, pushData);
+            logger.info(`📡 [FcmChannelProvider] MULTICAST → FCM Topic "${topic}" [Notif ${_id}]`);
+            results.push({ topic, ...r });
+          }
+
+          const anySuccess = results.some((r) => r.success);
+          return {
+            channel: this.channelName,
+            success: anySuccess,
+            targetTopics: topics,
+          };
+        }
+
+        // -----------------------------------------------------------------
+        // BROADCAST — send to the reserved "broadcast_all" FCM topic.
+        // All users auto-subscribe to this topic on socket connect.
+        // -----------------------------------------------------------------
+        case "BROADCAST": {
+          const topic = "broadcast_all";
+          const result = await sendPush(topic, title, message, pushData);
+          logger.info(`📢 [FcmChannelProvider] BROADCAST → FCM Topic "${topic}" [Notif ${_id}]`);
+          return {
+            channel: this.channelName,
+            success: result.success,
+            messageId: result.messageId,
+            targetTopics: [topic],
+            error: result.error,
+          };
+        }
+
+        default:
+          logger.warn(`⚠️ [FcmChannelProvider] Unknown scope "${scope}" for Notif ${_id}.`);
           return {
             channel: this.channelName,
             success: false,
-            error: "No FCM token registered for recipient",
+            error: `Unknown notification scope: ${scope}`,
           };
-        }
       }
-
-      // 2. BROADCAST: Send to global subscriber topic
-      if (scope === "BROADCAST") {
-        const result = await sendPush("topic_all_users", title, message, pushData);
-        logger.info(`📢 [FcmChannelProvider] Broadcast FCM delivered to topic_all_users`);
-        return {
-          channel: this.channelName,
-          success: result.success,
-          messageId: result.messageId,
-          error: result.error,
-        };
-      }
-
-      // 3. MULTICAST: Resolve target topic using dynamic tags or legacy regional combinations
-      let targetTopic = "";
-
-      // Prioritize tags if provided (e.g. "role:driver" -> "topic_tag_role_driver")
-      if (Array.isArray(tags) && tags.length > 0) {
-        const primaryTag = sanitizeTopic(tags[0].replace(/:/g, "_"));
-        targetTopic = `topic_tag_${primaryTag}`;
-      } else {
-        const div = sanitizeTopic(region);
-        const dist = sanitizeTopic(district);
-        const role = recipientRole;
-
-        if (region && (!role || role === "ALL")) {
-          targetTopic = `topic_div_${div}`;
-        } else if (district && (!role || role === "ALL")) {
-          targetTopic = `topic_dist_${dist}`;
-        } else if (region && role) {
-          targetTopic = `topic_div_${div}_role_${role}`;
-        } else if (district && role) {
-          targetTopic = `topic_dist_${dist}_role_${role}`;
-        } else if (role) {
-          targetTopic = `topic_role_${role}`;
-        }
-      }
-
-      if (targetTopic) {
-        const result = await sendPush(targetTopic, title, message, pushData);
-        logger.info(`📡 [FcmChannelProvider] Multicast FCM delivered to Topic: ${targetTopic}`);
-        return {
-          channel: this.channelName,
-          success: result.success,
-          messageId: result.messageId,
-          targetTopic,
-          error: result.error,
-        };
-      }
-
-      logger.warn(`⚠️ [FcmChannelProvider] No matching topic resolved for notification ${_id}`);
-      return {
-        channel: this.channelName,
-        success: false,
-        error: "No valid FCM topic resolved for multicast",
-      };
     } catch (error) {
-      logger.error(`❌ [FcmChannelProvider] Delivery failure for notif ${_id}: ${error.message}`);
-      return {
-        channel: this.channelName,
-        success: false,
-        error: error.message,
-      };
+      logger.error(`❌ [FcmChannelProvider] Delivery failure for Notif ${_id}: ${error.message}`);
+      return { channel: this.channelName, success: false, error: error.message };
     }
   }
 }

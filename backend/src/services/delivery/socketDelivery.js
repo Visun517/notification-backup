@@ -1,72 +1,66 @@
 const logger = require("../../utils/logger");
 
 /**
- * Socket Delivery Service
- * 
- * Description:
- * This function is responsible for sending real-time messages to users who are currently online (App is open).
- * It calculates the correct Socket.io "Room" based on the notification's scope and target details.
+ * Socket Delivery Service.
+ *
+ * Routes real-time notifications to connected users via Socket.io.
+ * This service is 100% domain-agnostic — it knows nothing about geography,
+ * roles, or any other host-app concept.
+ *
+ * Routing rules:
+ *   UNICAST   → private room "user_<recipientId>"         (one person)
+ *   MULTICAST → one "tag:<name>" room per tag in the      (matched subscribers)
+ *               notification's `tags` array
+ *   BROADCAST → io.emit (every connected socket)          (everyone)
+ *
+ * The host application populates `notification.tags` when calling
+ * sendNotification(). The engine fans out to all rooms matching those tags.
  */
 exports.deliverViaSocket = (io, notification) => {
-  // Extract all the necessary routing details from the notification document
-  const { _id, scope, recipientId, recipientRole, region, district } =
-    notification;
-    
-  let targetRoom = null;
+  const { _id, scope, recipientId, tags = [] } = notification;
 
   switch (scope) {
-    // --- 1. PERSONAL MESSAGES ---
-    case "UNICAST":
-      // Target the private room unique to the specific user
-      targetRoom = `user_${recipientId}`;
+    // -----------------------------------------------------------------------
+    // UNICAST — private message to one specific user
+    // -----------------------------------------------------------------------
+    case "UNICAST": {
+      const room = `user_${recipientId}`;
+      logger.info(`📡 [Socket] UNICAST → Room "${room}" (Notif ${_id})`);
+      io.to(room).emit("new_notification", notification);
       break;
+    }
 
-    // --- 2. GROUP MESSAGES ---
-    case "MULTICAST":
-      // Determine the correct room based on location and role.
-      // The logic checks from the most specific area to the broadest area.
+    // -----------------------------------------------------------------------
+    // MULTICAST — fan-out to every tag room listed on the notification.
+    // Socket.io handles deduplication: if a user is in multiple matching rooms
+    // they still receive the event only once per connection.
+    // -----------------------------------------------------------------------
+    case "MULTICAST": {
+      if (!tags || tags.length === 0) {
+        logger.warn(
+          `⚠️  [Socket] MULTICAST Notif ${_id} has no tags — no rooms targeted.`,
+        );
+        break;
+      }
 
-      // A. If sending to EVERYONE in a specific Division
-      if (region && (!recipientRole || recipientRole === "ALL")) {
-        targetRoom = `region_${region}`;
-      } 
-      // B. If sending to EVERYONE in a specific District
-      else if (district && (!recipientRole || recipientRole === "ALL")) {
-        targetRoom = `district_${district}`;
-      } 
-      // C. If sending to a specific Role in a Division (e.g., Drivers in Balangoda)
-      else if (recipientRole && region) {
-        targetRoom =  `region_${region}_role_${recipientRole}`;
-      } 
-      // D. If sending to a specific Role in a District (e.g., Tourists in Ratnapura)
-      else if (recipientRole && district) {
-        targetRoom = `district_${district}_role_${recipientRole}`;  
-      } 
-      // E. If sending to a Role across the whole country (e.g., All System Admins)
-      else if (recipientRole) {
-        targetRoom = `role_${recipientRole}`;
+      for (const tag of tags) {
+        const room = `tag:${tag}`;
+        logger.info(`📡 [Socket] MULTICAST → Room "${room}" (Notif ${_id})`);
+        io.to(room).emit("new_notification", notification);
       }
       break;
+    }
 
-    // --- 3. PUBLIC MESSAGES ---
-    case "BROADCAST":
-      logger.info(
-        ` [Socket] Broadcasting notification ${_id} to ALL connected users.`,
-      );
-      // io.emit sends the message to everyone connected to the server. No rooms needed.
-      return io.emit("new_notification", notification);
-  }
+    // -----------------------------------------------------------------------
+    // BROADCAST — emit to every connected socket
+    // -----------------------------------------------------------------------
+    case "BROADCAST": {
+      logger.info(`📡 [Socket] BROADCAST → All connected clients (Notif ${_id})`);
+      io.emit("new_notification", notification);
+      break;
+    }
 
-  // Finally, send the message to the determined target room
-  if (targetRoom) {
-    logger.info(
-      ` [Socket] Emitting notification ${_id} to Room: ${targetRoom}`,
-    );
-    io.to(targetRoom).emit("new_notification", notification);
-  } else {
-    // If no room matched the conditions, log a warning instead of crashing
-    logger.warn(
-      ` [Socket] Target room NOT FOUND for notification: ${_id}. Check logic!`,
-    );
+    default:
+      logger.warn(`⚠️  [Socket] Unknown scope "${scope}" for Notif ${_id}.`);
   }
 };

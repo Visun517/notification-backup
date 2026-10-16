@@ -7,7 +7,6 @@ const notificationHandler = require("./socket/notificationHandler");
 const notificationRoutes = require("./src/routes/notificationRoutes.js");
 const globalErrorHandler = require("./src/middleware/errorMiddleware");
 require("./src/configs/firebaseConfig");
-const seedRegions = require("./src/utils/dbSeeder");
 const socketAuth = require("./src/middleware/socketAuthMiddleware");
 const cors = require("cors");
 
@@ -70,7 +69,7 @@ io.use(socketAuth);
 
 /*
  * Initialize the core real-time notification engine.
- * This handles user room joining, FCM topic subscriptions, and live GPS tracking/throttling.
+ * This handles user room joining and tag-based room subscriptions.
  */
 notificationHandler(io);
 
@@ -111,12 +110,6 @@ mongoose
   .connect(process.env.MONGODB_URI)
   .then(async () => {
     console.log("DB connection successful!");
-
-    /*
-     * Auto-seed geographic regions on startup.
-     * This is required for the Notification Engine's local geo-fencing (location-based alerts) to work properly.
-     */
-    await seedRegions();
 
     const PORT = process.env.PORT || 5000;
     server.listen(PORT, () => {

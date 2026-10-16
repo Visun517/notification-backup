@@ -148,3 +148,49 @@ exports.updatePreferences = catchAsync(async (req, res, next) => {
     data: { userId: profile.userId, preferences: profile.preferences },
   });
 });
+
+// ---------------------------------------------------------------------------
+// 4. Update Subscribed Tags
+// PATCH /api/notifications/profile/:userId/tags
+// ---------------------------------------------------------------------------
+exports.updateSubscribedTags = catchAsync(async (req, res, next) => {
+  const { userId } = req.params;
+  const { tags, mode = "replace", tenantId: bodyTenantId } = req.body;
+
+  if (!Array.isArray(tags)) {
+    return next(new AppError("'tags' must be an array of strings.", 400));
+  }
+
+  // Sanitize: keep only non-empty strings, lowercase, strip whitespace
+  const sanitizedTags = [...new Set(
+    tags.map((t) => String(t).trim().toLowerCase()).filter(Boolean),
+  )];
+
+  const tenantId =
+    req.headers["x-tenant-id"] || bodyTenantId || req.user?.tenantId || "default";
+
+  let updateOp;
+  if (mode === "merge") {
+    // Add new tags without removing existing ones
+    updateOp = { $addToSet: { subscribedTags: { $each: sanitizedTags } } };
+  } else {
+    // Replace the full tag set (default)
+    updateOp = { $set: { subscribedTags: sanitizedTags } };
+  }
+
+  const profile = await NotificationProfile.findOneAndUpdate(
+    { userId, tenantId },
+    updateOp,
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+
+  logger.info(
+    `🏷️  [ProfileController] Tags updated (mode=${mode}) for User ${userId} [Tenant: ${tenantId}]: [${sanitizedTags.join(", ")}]`,
+  );
+
+  res.status(200).json({
+    status: "success",
+    message: `Subscribed tags updated (mode: ${mode}).`,
+    data: { userId: profile.userId, subscribedTags: profile.subscribedTags },
+  });
+});

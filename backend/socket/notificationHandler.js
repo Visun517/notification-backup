@@ -1,212 +1,144 @@
-const User = require("../src/models/User.js");
-const { getRegionFromCoords } = require("../src/utils/locationHelper.js");
-const socketService = require("../src/services/delivery/socketService");
-const fcmService = require("../src/services/delivery/fcmService");
-const calculateDistance = require("../src/utils/geoUtils.js");
+const NotificationProfile = require("../src/models/NotificationProfile");
 const AppError = require("../src/errors/appError");
 const logger = require("../src/utils/logger");
+const { manageTagTopics } = require("../src/services/delivery/fcmService");
 
+/**
+ * Notification Handler — Generic Tag/Topics Socket Gateway.
+ *
+ * This handler is 100% domain-agnostic. It knows nothing about geography,
+ * roles, or any other host-application concepts.
+ *
+ * How it works:
+ *  1. On connect  → load the user's subscribedTags from NotificationProfile
+ *  2. Join one Socket.io room per tag  (e.g. room "tag:colombo", "tag:driver")
+ *  3. On "subscribe_tags" event → host app can update live tag rooms
+ *  4. On disconnect → Socket.io auto-leaves all rooms
+ *
+ * The host application is fully responsible for deciding which tags a user
+ * should have. The engine only reacts to what it is told.
+ */
 module.exports = (io) => {
   io.on("connection", async (socket) => {
-    // Get user details attached by the Socket Auth Middleware
-    const userId = socket.userId;
-    const role = socket.userRole;
+    const userId   = socket.userId;
+    const tenantId = socket.tenantId || "default";
 
     logger.info(
-      `🔒 Secure Socket Connected: User=${userId}, Role=${role}, SocketID=${socket.id}`,
+      `🔒 Socket Connected: User=${userId}, Tenant=${tenantId}, SocketID=${socket.id}`,
     );
 
-    // Join the basic private room and role-specific room
+    // --- Private room: always available for UNICAST delivery ---
     socket.join(`user_${userId}`);
-    socket.join(`role_${role}`);
 
     /**
-     * Helper function to handle and emit socket errors to the frontend.
-     * Prevents the server from crashing when an error occurs inside the socket.
+     * Emits a structured error event back to this specific client.
+     * Prevents the server from crashing on unhandled errors inside socket handlers.
      */
     const handleSocketError = (err, eventName) => {
       const statusCode = err.statusCode || 500;
-      const message = err.message || "Internal Socket Error";
-
-      logger.error(`❌ [Socket ${eventName}] User=${userId}: ${message}`);
-
-      // Send the error back to the client
-      socket.emit("error", {
-        status: err.status || "error",
-        statusCode,
-        message,
-        event: eventName,
-      });
+      const message    = err.message    || "Internal Socket Error";
+      logger.error(`❌ [Socket:${eventName}] User=${userId}: ${message}`);
+      socket.emit("error", { status: err.status || "error", statusCode, message, event: eventName });
     };
 
-    // --- INITIAL SYNC ---
-    // When the user connects, load their last known location and add them to regional rooms
+    // -----------------------------------------------------------------------
+    // INITIAL SYNC
+    // Load the user's current tag subscriptions, join the corresponding
+    // Socket.io rooms, and sync FCM topic subscriptions.
+    // -----------------------------------------------------------------------
     try {
-      const user = await User.findById(userId).select(
-        "currentLocation fcmToken",
-      );
+      const profile = await NotificationProfile.findOne({ userId, tenantId })
+        .select("subscribedTags fcmTokens")
+        .lean();
 
-      if (!user) throw new AppError("User not found during initial sync", 404);
+      const tags      = profile?.subscribedTags ?? [];
+      const fcmTokens = profile?.fcmTokens      ?? [];
 
-      // Attach FCM token to the socket session for later use
-      socket.fcmToken = user.fcmToken;
+      // --- Socket.io rooms ---
+      // One room per tag — rooms are named "tag:<tagName>"
+      tags.forEach((tag) => socket.join(`tag:${tag}`));
 
-      if (user.currentLocation?.coordinates) {
-        // MongoDB uses [longitude, latitude] format
-        const [lng, lat] = user.currentLocation.coordinates;
-        const regionData = await getRegionFromCoords(lat, lng);
-
-        if (regionData && typeof regionData === "object") {
-          // Add user to the relevant Socket rooms (instant in-memory operation)
-          socketService.manageRegionalRooms(socket, regionData, role, "join");
-
-          // Save current location details in the socket session to track future movements
-          socket.currentDivision = regionData.division;
-          socket.currentDistrict = regionData.district;
-
-          // DECOUPLED ASYNC TASK: Subscribe to FCM topics without blocking WebSocket event loop
-          if (socket.fcmToken) {
-            const token = socket.fcmToken;
-            setImmediate(async () => {
-              try {
-                await fcmService.manageRegionalTopics(
-                  token,
-                  regionData,
-                  role,
-                  "subscribe",
-                );
-              } catch (fcmErr) {
-                logger.error(
-                  `Background FCM initial subscribe failed for User=${userId}: ${fcmErr.message}`,
-                );
-              }
-            });
-          }
-
-          logger.info(
-            `Initial Sync Success: User=${userId}, Region=${regionData.division}`,
-          );
+      // --- FCM topic subscriptions ---
+      // Subscribe each registered device token to:
+      //   1. One FCM topic per subscribed tag   ("tag_<tagName>")
+      //   2. The reserved "broadcast_all" topic  (required for BROADCAST push)
+      for (const token of fcmTokens) {
+        if (tags.length > 0) {
+          await manageTagTopics(token, tags, "subscribe");
         }
+        await manageTagTopics(token, ["broadcast_all"], "subscribe");
       }
+
+      // Store on socket session for later diffing in subscribe_tags
+      socket.subscribedTags = new Set(tags);
+      socket.fcmTokens      = fcmTokens;
+
+      logger.info(
+        `✅ Initial Sync: User=${userId}, Tags=[${tags.join(", ")}], FCM tokens=${fcmTokens.length}`,
+      );
     } catch (err) {
       handleSocketError(err, "initial_sync");
     }
 
-    // --- LOCATION UPDATE ---
-    // Listens to live GPS updates from the client app
-    socket.on("update_location", async (data) => {
+    // -----------------------------------------------------------------------
+    // SUBSCRIBE_TAGS  (Host app → Engine)
+    // The host app calls this when the user's tag membership changes
+    // (e.g. user moves to a new city, changes role, upgrades plan).
+    //
+    // Payload:  { tags: string[], mode: "replace" | "merge" }
+    //   replace  → leave rooms for removed tags, join rooms for new tags
+    //   merge    → only add new tags (never remove)
+    // -----------------------------------------------------------------------
+    socket.on("subscribe_tags", async ({ tags: newTags = [], mode = "replace" } = {}) => {
       try {
-        // Concurrency lock: prevent overlapping location updates for this socket
-        if (socket.isUpdatingLocation) {
-          logger.debug(`Location update already running for user ${userId}`);
-          return;
+        if (!Array.isArray(newTags)) {
+          return handleSocketError(new AppError("'tags' must be an array of strings.", 400), "subscribe_tags");
         }
 
-        socket.isUpdatingLocation = true;
+        const sanitized = [...new Set(
+          newTags.map((t) => String(t).trim().toLowerCase()).filter(Boolean),
+        )];
 
-        const { lat, lng } = data;
+        const current = socket.subscribedTags ?? new Set();
+        const next    = mode === "merge"
+          ? new Set([...current, ...sanitized])
+          : new Set(sanitized);
 
-        if (lat === undefined || lng === undefined) {
-          throw new AppError("Latitude and Longitude are required", 400);
+        const added   = [...next].filter((t) => !current.has(t));
+        const removed = [...current].filter((t) => !next.has(t));
+
+        // --- Socket.io rooms ---
+        removed.forEach((tag) => socket.leave(`tag:${tag}`));
+        added.forEach((tag) => socket.join(`tag:${tag}`));
+
+        // --- FCM topic subscriptions (mirror the Socket.io room diff) ---
+        const fcmTokens = socket.fcmTokens ?? [];
+        for (const token of fcmTokens) {
+          if (removed.length > 0) await manageTagTopics(token, removed, "unsubscribe");
+          if (added.length   > 0) await manageTagTopics(token, added,   "subscribe");
         }
 
-        // PERFORMANCE OPTIMIZATION (Throttling)
-        // If user moved less than 100 meters, skip the expensive region check
-        if (socket.lastLat && socket.lastLng) {
-          const distance = calculateDistance(
-            socket.lastLat,
-            socket.lastLng,
-            lat,
-            lng,
-          );
-          if (distance < 100) {
-            return await updateDBLocation(userId, lat, lng, role);
-          }
-        }
+        socket.subscribedTags = next;
 
-        // Update last known coordinates in socket session
-        socket.lastLat = lat;
-        socket.lastLng = lng;
+        logger.info(
+          `🏷️  [subscribe_tags] User=${userId}, Mode=${mode}, Tags=[${[...next].join(", ")}]`,
+        );
 
-        // Check if the user entered a new region
-        const regionData = await getRegionFromCoords(lat, lng);
-
-        if (
-          regionData &&
-          typeof regionData === "object" &&
-          regionData.division !== socket.currentDivision
-        ) {
-          const oldRegion = {
-            division: socket.currentDivision,
-            district: socket.currentDistrict,
-          };
-
-          // 1. Manage Socket.io rooms immediately in memory
-          socketService.manageRegionalRooms(socket, oldRegion, role, "leave");
-          socketService.manageRegionalRooms(socket, regionData, role, "join");
-
-          logger.info(
-            `🔄 Region Switch: User=${userId}, From=${socket.currentDivision}, To=${regionData.division}`,
-          );
-
-          // Update current region in socket session
-          socket.currentDivision = regionData.division;
-          socket.currentDistrict = regionData.district;
-
-          // 2. DECOUPLED ASYNC TASK: Handle external FCM topic un/subscribes in the background
-          if (socket.fcmToken) {
-            const token = socket.fcmToken;
-            setImmediate(async () => {
-              try {
-                if (oldRegion.division && oldRegion.district) {
-                  await fcmService.manageRegionalTopics(
-                    token,
-                    oldRegion,
-                    role,
-                    "unsubscribe",
-                  );
-                }
-                await fcmService.manageRegionalTopics(
-                  token,
-                  regionData,
-                  role,
-                  "subscribe",
-                );
-              } catch (fcmErr) {
-                logger.error(
-                  `Background FCM region switch failed for User=${userId}: ${fcmErr.message}`,
-                );
-              }
-            });
-          }
-        }
-
-        // Always update the exact GPS location in the Database
-        await updateDBLocation(userId, lat, lng, role);
-      } catch (error) {
-        handleSocketError(error, "update_location");
-      } finally {
-        socket.isUpdatingLocation = false;
+        socket.emit("tags_updated", {
+          status: "success",
+          subscribedTags: [...next],
+        });
+      } catch (err) {
+        handleSocketError(err, "subscribe_tags");
       }
     });
 
+    // -----------------------------------------------------------------------
+    // DISCONNECT
+    // Socket.io automatically leaves all rooms on disconnect — nothing to do.
+    // -----------------------------------------------------------------------
     socket.on("disconnect", () => {
       logger.info(`👋 Socket Disconnected: User=${userId}`);
     });
   });
-};
-
-/**
- * Helper function to update the user's live location in MongoDB.
- * If the user is a DRIVER, it also sets 'showCurrentLocation' to true.
- */
-const updateDBLocation = async (userId, lat, lng, role) => {
-  try {
-    await User.findByIdAndUpdate(userId, {
-      currentLocation: { type: "Point", coordinates: [lng, lat] },
-      ...(role === "DRIVER" && { showCurrentLocation: true }),
-    });
-  } catch (err) {
-    logger.error(`DB Update Failed for User=${userId}: ${err.message}`);
-  }
 };

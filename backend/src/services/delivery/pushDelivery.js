@@ -1,98 +1,152 @@
-const NotificationProfile = require("../models/NotificationProfile");
-const sendPush = require("../utils/pushNotificationHelper");
-const logger = require("../utils/logger");
+const NotificationProfile = require("../../models/NotificationProfile");
+const sendPush = require("../../utils/pushNotificationHelper");
+const logger = require("../../utils/logger");
 
 /**
- * Helper function to clean up topic names.
- * Firebase topics cannot contain spaces or special characters.
- */
-const sanitizeTopic = (name) =>
-  name ? name.replace(/[^a-zA-Z0-9-_.~%]/g, "") : "";
-
-/**
- * Delivers notifications to mobile devices via Firebase Cloud Messaging (FCM).
- * This runs in the background and does not block the main Socket.io delivery.
+ * Push Delivery Service — FCM.
  *
- * DECOUPLED: FCM tokens are now sourced from the engine's own NotificationProfile
- * collection, replacing the previous tight coupling to the host app's User model.
+ * Delivers notifications to mobile devices via Firebase Cloud Messaging (FCM).
+ * Routing mirrors socketDelivery.js exactly — 100% domain-agnostic.
+ *
+ * Routing rules:
+ *   UNICAST   → send directly to the recipient's registered FCM tokens
+ *               (fetched from NotificationProfile by userId + tenantId)
+ *   MULTICAST → fan-out to one FCM topic per tag in notification.tags
+ *               Topic naming: "tag_<tagName>"  (underscores, not colons —
+ *               FCM topics cannot contain colons or spaces)
+ *               Users are subscribed to these topics on socket connect via
+ *               notificationHandler.js → fcmService.manageTagTopics()
+ *   BROADCAST → send to the reserved "broadcast_all" FCM topic.
+ *               All users are auto-subscribed to this topic on connect.
+ *
+ * No geography, roles, regions, or districts anywhere in this file.
+ * The host application controls audience targeting exclusively through tags.
+ */
+
+/**
+ * Sanitize a tag string into a valid FCM topic component.
+ * FCM topics allow: letters, digits, hyphens, underscores, tildes, percent.
+ * Mirrors the sanitizeTag() in fcmService.js for consistency.
+ *
+ * @param {string} tag
+ * @returns {string}
+ */
+const sanitizeTag = (tag) => tag.replace(/[^a-zA-Z0-9-_.~%]/g, "_");
+
+/**
+ * Build a prefixed FCM topic name from a generic tag string.
+ * The "tag_" prefix lets pushNotificationHelper identify this as a topic
+ * (not a device token) and route it via messaging().send({ topic }).
+ *
+ * @param {string} tag  e.g. "driver", "region:south", "premium"
+ * @returns {string}    e.g. "tag_driver", "tag_region_south", "tag_premium"
+ */
+const toFcmTopic = (tag) => `tag_${sanitizeTag(tag)}`;
+
+/**
+ * Deliver a notification via FCM push to devices or FCM topics.
+ *
+ * @param {Object} notification - The persisted Notification document (plain object or Mongoose doc)
  */
 exports.deliverViaPush = async (notification) => {
-  // Extract notification details
   const {
     _id,
     scope,
     recipientId,
-    recipientRole,
-    region,
-    district,
+    tags = [],
     title,
     message,
-    actionUrl,
+    actionUrl = "",
     tenantId = "default",
   } = notification;
 
-  // Extra data sent invisibly to the app (FCM requires all values to be strings)
-  const pushData = { url: String(actionUrl), notificationId: String(_id) };
+  // Invisible data payload sent alongside the visible push notification.
+  // FCM requires all values to be strings.
+  const pushData = {
+    url: String(actionUrl),
+    notificationId: String(_id),
+  };
 
   try {
-    // --- 1. PERSONAL MESSAGES (UNICAST) ---
-    if (scope === "UNICAST") {
-      // Look up the user's registered FCM tokens from the decoupled NotificationProfile
-      const profile = await NotificationProfile.findOne({
-        userId: String(recipientId),
-        tenantId,
-      }).select("fcmTokens");
+    switch (scope) {
+      // -----------------------------------------------------------------------
+      // UNICAST — direct message to one specific user.
+      // Sends to every FCM token the user has registered (multi-device support).
+      // -----------------------------------------------------------------------
+      case "UNICAST": {
+        const profile = await NotificationProfile.findOne({
+          userId: String(recipientId),
+          tenantId,
+        }).select("fcmTokens");
 
-      if (profile?.fcmTokens?.length > 0) {
-        // Send to all registered device tokens for this user
+        if (!profile?.fcmTokens?.length) {
+          logger.warn(
+            `⚠️  [PushDelivery] UNICAST skipped: no FCM tokens registered for User ${recipientId} [Tenant: ${tenantId}]`,
+          );
+          break;
+        }
+
         for (const token of profile.fcmTokens) {
           await sendPush(token, title, message, pushData);
         }
-        logger.info(`📲 FCM Unicast sent to User: ${recipientId} (${profile.fcmTokens.length} device(s))`);
-      } else {
-        logger.warn(`⚠️ FCM Unicast skipped: No registered tokens for User ${recipientId}`);
+
+        logger.info(
+          `📲 [PushDelivery] UNICAST → User ${recipientId} (${profile.fcmTokens.length} device(s)) [Notif ${_id}]`,
+        );
+        break;
       }
-    }
 
-    // --- 2. GROUP MESSAGES (MULTICAST) ---
-    else if (scope === "MULTICAST") {
-      const role = recipientRole;
-      const div = sanitizeTopic(region);
-      const dist = sanitizeTopic(district);
-      let targetTopic = "";
+      // -----------------------------------------------------------------------
+      // MULTICAST — fan-out to every FCM topic matching the notification's tags.
+      //
+      // Each tag in notification.tags maps to an FCM topic "tag_<tagName>".
+      // Users are subscribed to these topics by notificationHandler.js on connect
+      // (via fcmService.manageTagTopics). The engine never decides which topics
+      // a user belongs to — the host app controls that via subscribedTags.
+      // -----------------------------------------------------------------------
+      case "MULTICAST": {
+        if (!tags.length) {
+          logger.warn(
+            `⚠️  [PushDelivery] MULTICAST Notif ${_id} has no tags — skipping FCM delivery.`,
+          );
+          break;
+        }
 
-      // Determine the most specific Firebase topic to send the message to
-
-      // A. If sending to EVERYONE in a specific Division
-      if (region && (!role || role === "ALL")) targetTopic = `topic_div_${div}`;
-
-      // B. If sending to EVERYONE in a specific District
-      else if (district && (!role || role === "ALL")) targetTopic = `topic_dist_${dist}`;
-
-      // C. If sending to a specific Role in a Division (e.g., Drivers in Balangoda)
-      else if (region && role) targetTopic = `topic_div_${div}_role_${role}`;
-
-      // D. If sending to a specific Role in a District (e.g., Tourists in Ratnapura)
-      else if (district && role) targetTopic = `topic_dist_${dist}_role_${role}`;
-
-      // E. If sending to a Role across the whole country (e.g., All System Admins)
-      else if (role) targetTopic = `topic_role_${role}`;
-
-      // Send the push message to the determined topic
-      if (targetTopic) {
-        await sendPush(targetTopic, title, message, pushData);
-        logger.info(` FCM Multicast sent to Topic: ${targetTopic}`);
+        for (const tag of tags) {
+          const topic = toFcmTopic(tag);
+          await sendPush(topic, title, message, pushData);
+          logger.info(
+            `📲 [PushDelivery] MULTICAST → FCM Topic "${topic}" [Notif ${_id}]`,
+          );
+        }
+        break;
       }
-    }
 
-    // --- 3. PUBLIC MESSAGES (BROADCAST) ---
-    else if (scope === "BROADCAST") {
-      // Send to the global topic that every user is subscribed to
-      await sendPush("topic_all_users", title, message, pushData);
-      logger.info(` FCM Broadcast sent to all users`);
+      // -----------------------------------------------------------------------
+      // BROADCAST — platform-wide push to every registered device.
+      //
+      // Sends to the reserved "broadcast_all" FCM topic.
+      // All users are subscribed to this topic automatically on socket connect
+      // (notificationHandler.js calls manageTagTopics with ["broadcast_all"]).
+      // -----------------------------------------------------------------------
+      case "BROADCAST": {
+        const topic = "broadcast_all";
+        await sendPush(topic, title, message, pushData);
+        logger.info(
+          `📲 [PushDelivery] BROADCAST → FCM Topic "${topic}" [Notif ${_id}]`,
+        );
+        break;
+      }
+
+      default:
+        logger.warn(
+          `⚠️  [PushDelivery] Unknown scope "${scope}" for Notif ${_id} — no FCM delivery attempted.`,
+        );
     }
   } catch (error) {
-    // If FCM fails, log the error but do not crash the server
-    logger.error(` FCM Delivery Failed for Notif ${_id}: ${error.message}`);
+    // Never crash the worker — log and continue.
+    logger.error(
+      `❌ [PushDelivery] FCM delivery failed for Notif ${_id}: ${error.message}`,
+    );
   }
 };

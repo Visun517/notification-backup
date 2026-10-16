@@ -4,117 +4,114 @@ const AppError = require("../errors/appError");
 const logger = require("../utils/logger");
 
 /**
- * Example Controller for Notification Engine Integration
- * 
- * Description:
- * This controller serves as a guide for other developers on how to send notifications 
- * from their respective modules (e.g., Booking, Bidding, or Admin panels).
- * 
- * Types of Notifications you can send (Scopes):
- * 1. UNICAST: Private message to a specific user. (Requires: 'recipientId')
- * 2. MULTICAST: Group message based on Role and/or Location. (Requires: 'recipientRole', and optionally 'region' or 'district')
- * 3. BROADCAST: Public message to everyone in the system. (No specific recipient required)
- * 
- * How to send a notification (3 Simple Steps):
- * Step 1: Get the 'io' instance from the request object (req.app.get('io')).
- * Step 2: Build the payload object matching the Notification Schema.
- * Step 3: Call 'await sendNotification(io, payload)'.
+ * Example / Simulation Controller.
+ *
+ * Demonstrates how to send notifications using the generic Tags/Topics pattern.
+ * This controller is intentionally domain-agnostic — no place names, role names,
+ * or geography. All audience targeting is done through arbitrary string tags.
+ *
+ * HOW TO SEND A NOTIFICATION (3 steps):
+ *   1. Assign tags to your users via  PATCH /api/notifications/profile/:userId/tags
+ *   2. Build a payload with matching   tags: ["tag-a", "tag-b"]
+ *   3. Call sendNotification(payload)
+ *
+ * SCOPES:
+ *   UNICAST   — private message to one user (requires recipientId)
+ *   MULTICAST — fan-out to all users subscribed to any of the listed tags
+ *   BROADCAST — delivered to every connected user (no tags needed)
  */
 const triggerSimulation = catchAsync(async (req, res, next) => {
-  // Step 1: Retrieve the global Socket.io instance from the Express app
   const io = req.app.get("io");
-  
-  const { 
-    type,        // Defines the scope: 'UNICAST', 'MULTICAST', or 'BROADCAST'
-    scenario,    // Used here to auto-fill test data: 'ROAD_CLOSURE', 'SURF_ALERT', etc.
-    recipientId, // Target User ID (Mandatory for UNICAST)
-    role,        // Target User Role (Mandatory for MULTICAST)
-    region,      // Target Divisional Secretariat (Optional for MULTICAST)
-    district     // Target District (Optional for MULTICAST)
+
+  const {
+    type,        // "UNICAST" | "MULTICAST" | "BROADCAST"
+    scenario,    // Preset name for auto-filling test data
+    recipientId, // Required for UNICAST
+    tags,        // Array of tag strings for MULTICAST
+    channels,    // Override delivery channels
   } = req.body;
 
   if (!type || !scenario) {
-    return next(new AppError("Please provide both 'type' and 'scenario' in the request body", 400));
+    return next(
+      new AppError("Please provide both 'type' and 'scenario' in the request body.", 400),
+    );
   }
 
-  // Step 2: Construct the Notification Payload
-  // Supports dynamic tags, multi-channel routing, and templating
+  // Base payload — all fields are generic
   let payload = {
-    scope: type,
-    recipientId: recipientId,
-    recipientRole: role,
-    tags: req.body.tags || (role ? [`role:${role}`] : []),
-    channels: req.body.channels || ["IN_APP", "PUSH"],
-    region: region,
-    district: district,
-    title: "Test Alert",
-    message: "This is a default test message.",
-    category: "SYSTEM",
-    priority: "normal",
-    actionUrl: "/home",
-    data: req.body.data || {},
+    scope:       type,
+    recipientId: recipientId || undefined,
+    tags:        Array.isArray(tags) ? tags : [],
+    channels:    Array.isArray(channels) ? channels : ["IN_APP", "PUSH"],
+    title:       "Notification",
+    message:     "This is a test notification.",
+    category:    "GENERAL",
+    priority:    "normal",
+    actionUrl:   "/",
+    metadata:    req.body.metadata || {},
   };
 
-  // Populate dummy data based on the requested testing scenario
+  // ---------------------------------------------------------------------------
+  // Generic scenario presets — no domain-specific content
+  // ---------------------------------------------------------------------------
   switch (scenario) {
-    case 'ROAD_CLOSURE': // Ideal for MULTICAST (Region)
-      payload.title = "Road Closure Alert";
-      payload.message = `Galle Road in ${region || 'your area'} closed for 1 hour due to a parade.`;
-      payload.category = 'SAFETY';
-      payload.priority = 'high';
-      payload.actionUrl = '/map/alerts';
+    case "WELCOME":
+      // UNICAST: greet a newly registered user
+      payload.title    = "Welcome aboard!";
+      payload.message  = "Your account is ready. Explore what's new.";
+      payload.category = "SYSTEM";
+      payload.priority = "normal";
+      payload.actionUrl = "/dashboard";
       break;
 
-    case 'SURF_ALERT': // Ideal for MULTICAST (Region + Role)
-      payload.title = "High Wave Alert";
-      payload.message = "Attention Instructors: Waves are over 5ft today in Mirissa area. Safety first!";
-      payload.category = 'SAFETY';
-      payload.priority = 'critical';
-      payload.actionUrl = '/activities/surf';
+    case "TAG_PUSH":
+      // MULTICAST: send to all users subscribed to the provided tags
+      payload.title    = "New Update for Your Group";
+      payload.message  = `A new update is available for users tagged: [${(tags || []).join(", ")}].`;
+      payload.category = "GENERAL";
+      payload.priority = "normal";
       break;
 
-    case 'BID_ACCEPTED': // Ideal for UNICAST
-      payload.title = "Bid Accepted!";
-      payload.message = "Congratulations! The tourist has accepted your offer. Check your active trips.";
-      payload.category = 'BOOKING';
-      payload.priority = 'high';
-      payload.actionUrl = '/trips/active';
+    case "ALERT":
+      // MULTICAST: high-priority alert to tagged audience
+      payload.title    = "Action Required";
+      payload.message  = "Please review the latest update in your dashboard.";
+      payload.category = "ALERT";
+      payload.priority = "high";
+      payload.actionUrl = "/alerts";
       break;
 
-    case 'EMERGENCY': // Ideal for BROADCAST
-      payload.title = "National Safety Warning!";
-      payload.message = "Strong winds and heavy rain expected nationwide. Avoid coastal areas.";
-      payload.category = 'SAFETY';
-      payload.priority = 'critical';
-      payload.actionUrl = '/safety/updates';
+    case "BROADCAST_ALL":
+      // BROADCAST: platform-wide announcement
+      payload.title    = "Platform Announcement";
+      payload.message  = "We have an important update for all users. Please read it in the app.";
+      payload.category = "SYSTEM";
+      payload.priority = "normal";
+      payload.actionUrl = "/announcements";
       break;
 
-    case 'SYSTEM_UPDATE': // Ideal for MULTICAST (Role only)
-      payload.title = "New Service Charges";
-      payload.message = "The system service charges have been updated. Please review the new policy.";
-      payload.category = 'SYSTEM';
-      payload.priority = 'low';
-      payload.actionUrl = '/policy';
+    case "MAINTENANCE":
+      // BROADCAST: scheduled downtime notice
+      payload.title    = "Scheduled Maintenance";
+      payload.message  = "The system will be unavailable for a short period. We apologize for the inconvenience.";
+      payload.category = "SYSTEM";
+      payload.priority = "low";
       break;
   }
 
-  // Allow overriding title and message via the request body for custom testing
-  if (req.body.title) payload.title = req.body.title;
+  // Allow caller to override title / message for custom testing
+  if (req.body.title)   payload.title   = req.body.title;
   if (req.body.message) payload.message = req.body.message;
 
-  logger.info(`Triggering Simulation: [${scenario}] | Scope: [${type}]`);
+  logger.info(`🧪 [Simulation] Scenario="${scenario}" | Scope="${type}" | Tags=[${payload.tags.join(", ")}]`);
 
-  // Step 3: Trigger the Central Notification Engine
-  // This single function call handles Database saving, Socket.io live emission, and FCM Push Notifications
   const result = await sendNotification(io, payload);
 
   res.status(200).json({
     status: "success",
-    message: `Test notification for '${scenario}' has been dispatched.`,
-    data: result
+    message: `Test notification for '${scenario}' dispatched.`,
+    data: result,
   });
 });
 
-module.exports = {
-  triggerSimulation,
-};  
+module.exports = { triggerSimulation };

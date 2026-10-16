@@ -37,6 +37,16 @@ const notificationProfileSchema = new Schema(
       default: [],
     },
 
+    // Generic tag subscriptions — set entirely by the host application.
+    // The engine never computes or interprets these; it only uses them for
+    // message fan-out matching (notification.tags ∩ profile.subscribedTags).
+    // Examples: ["colombo", "driver", "premium", "alerts", "region:south"]
+    subscribedTags: {
+      type: [String],
+      default: [],
+      index: true,
+    },
+
     // Per-channel opt-in preferences.
     // The NotificationService reads these to skip unwanted channels before queuing.
     preferences: {

@@ -1,13 +1,27 @@
 const mongoose = require("mongoose");
 const Notification = require("../models/Notification");
+const NotificationProfile = require("../models/NotificationProfile");
 const NotificationReadStatus = require("../models/NotificationReadStatus");
 const catchAsync = require("../utils/catchAsync");
 const AppError = require("../errors/appError");
 const logger = require("../utils/logger");
-const { getRegionFromCoords } = require("../utils/locationHelper");
 const redisHelper = require("../config/redisClient");
 const { getHealthStatus } = require("../utils/healthCheck");
 const { telemetry } = require("../utils/telemetry");
+
+/**
+ * Notification Controller — 100% Domain-Agnostic.
+ *
+ * All geo/role lookups have been removed. Notification feed filtering is now
+ * driven exclusively by two generic primitives:
+ *
+ *   1. recipientId  — UNICAST: a direct message to this specific user
+ *   2. tags         — MULTICAST/BROADCAST: profile.subscribedTags ∩ notification.tags
+ *
+ * The host application is responsible for assigning tags to users via
+ *   PATCH /api/notifications/profile/:userId/tags
+ * The engine never infers tags from location, role, or any other domain concept.
+ */
 
 /**
  * Extracts tenantId from request header, query, authenticated user, or defaults to "default".
@@ -24,65 +38,94 @@ const getTenantId = (req) => {
 };
 
 /**
- * 1. Fetch notifications with Pagination
- * GET /api/notifications?page=1&limit=20
- *
- * Description: Retrieves a list of notifications for the authenticated user.
+ * Resolves the user's subscribed tags from NotificationProfile.
+ * Checks Redis first (24h TTL), falls back to MongoDB.
+ * Returns an empty array if no profile exists — graceful degradation.
  */
-const getNotifications = catchAsync(async (req, res, next) => {
-  // Extract authenticated user populated by JWT auth middleware
-  const user = req.user;
-  const userId = req.userId || user._id.toString();
+const getUserTags = async (userId, tenantId, redisHelper) => {
+  const cacheKey = `tenant:${tenantId}:user:${userId}:subscribedTags`;
+  const legacyKey = `user:${userId}:subscribedTags`;
 
-  const userRole = user.role;
-  let userDistrict = null;
-  let userDivision = null;
-
-  if (user.currentLocation?.coordinates) {
-    const [lng, lat] = user.currentLocation.coordinates;
-    const regionData = await getRegionFromCoords(lat, lng);
-    if (regionData) {
-      userDivision = regionData.division;
-      userDistrict = regionData.district;
-    }
+  // 1. Redis cache check
+  let cached = await redisHelper.safeGet(cacheKey);
+  if (cached === null && tenantId === "default") {
+    cached = await redisHelper.safeGet(legacyKey);
+  }
+  if (cached) {
+    try {
+      return typeof cached === "string" ? JSON.parse(cached) : cached;
+    } catch (_) {}
   }
 
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 20;
-  const skip = (page - 1) * limit;
+  // 2. DB lookup
+  try {
+    const profile = await NotificationProfile.findOne({ userId, tenantId })
+      .select("subscribedTags")
+      .lean();
+    const tags = profile?.subscribedTags ?? [];
 
-  const matchCriteria = [
-    { recipientId: new mongoose.Types.ObjectId(userId) },
-    { recipientRole: userRole },
-    { recipientRole: "ALL" },
-    { tags: `role:${userRole}` },
-    { tags: "role:ALL" },
+    // Cache for 24 hours
+    await redisHelper.safeSet(cacheKey, tags, 86400);
+    if (tenantId === "default") {
+      await redisHelper.safeSet(legacyKey, tags, 86400);
+    }
+    return tags;
+  } catch (_) {
+    return [];
+  }
+};
+
+/**
+ * Builds the $or match criteria for a user's notification feed.
+ * Purely tag/recipientId based — no geo, no roles.
+ */
+const buildFeedMatchCriteria = (userId, userTags) => {
+  const criteria = [
+    // Direct private message to this user
+    { recipientId: userId },
+    // Public broadcast to everyone
     { scope: "BROADCAST" },
   ];
 
-  if (userDivision) matchCriteria.push({ region: userDivision });
-  if (userDistrict) matchCriteria.push({ district: userDistrict });
+  // Tag-based multicast: any notification whose tags overlap this user's subscriptions
+  if (userTags.length > 0) {
+    criteria.push({ tags: { $in: userTags } });
+  }
 
+  return criteria;
+};
+
+// ---------------------------------------------------------------------------
+// 1. Fetch Notifications with Pagination
+// GET /api/notifications?page=1&limit=20
+// ---------------------------------------------------------------------------
+const getNotifications = catchAsync(async (req, res, next) => {
+  const userId   = req.userId || req.user?.id;
   const tenantId = getTenantId(req);
 
-  const notifications = await Notification.aggregate([
-    // 1. Filter Messages partitioned by tenantId
-    {
-      $match: {
-        tenantId,
-        $or: matchCriteria,
-      },
-    },
+  if (!userId) return next(new AppError("User identity missing from request.", 401));
 
-    // 2. Deduplicate (Remove identical messages)
+  const page  = parseInt(req.query.page)  || 1;
+  const limit = parseInt(req.query.limit) || 20;
+  const skip  = (page - 1) * limit;
+
+  const userTags      = await getUserTags(userId, tenantId, redisHelper);
+  const matchCriteria = buildFeedMatchCriteria(userId, userTags);
+
+  const notifications = await Notification.aggregate([
+    // 1. Filter by tenant + recipient/tag match
+    { $match: { tenantId, $or: matchCriteria } },
+
+    // 2. Deduplicate
     { $group: { _id: "$_id", doc: { $first: "$$ROOT" } } },
     { $replaceRoot: { newRoot: "$doc" } },
 
-    // Sort & Paginate BEFORE $lookup
+    // 3. Sort & Paginate before $lookup
     { $sort: { createdAt: -1 } },
     { $skip: skip },
     { $limit: limit },
 
+    // 4. Join read status
     {
       $lookup: {
         from: "notificationreadstatuses",
@@ -93,7 +136,7 @@ const getNotifications = catchAsync(async (req, res, next) => {
               $expr: {
                 $and: [
                   { $eq: ["$notificationId", "$$notifId"] },
-                  { $eq: ["$userId", new mongoose.Types.ObjectId(userId)] },
+                  { $eq: ["$userId", userId] },
                 ],
               },
             },
@@ -103,13 +146,15 @@ const getNotifications = catchAsync(async (req, res, next) => {
       },
     },
 
+    // 5. Exclude soft-deleted entries
     { $match: { "readInfo.isDeleted": { $ne: true } } },
 
+    // 6. Normalise isRead across scopes
     {
       $addFields: {
         isRead: {
           $cond: {
-            if: { $eq: ["$scope", "UNICAST"] },
+            if:   { $eq: ["$scope", "UNICAST"] },
             then: "$isRead",
             else: { $gt: [{ $size: "$readInfo" }, 0] },
           },
@@ -127,26 +172,20 @@ const getNotifications = catchAsync(async (req, res, next) => {
   });
 });
 
-/**
- * 2. Mark as read
- * PATCH /api/notifications/:id/read
- *
- * Description: Marks a specific notification as 'read' when the user clicks on it.
- */
+// ---------------------------------------------------------------------------
+// 2. Mark as Read
+// PATCH /api/notifications/:id/read
+// ---------------------------------------------------------------------------
 const markAsRead = catchAsync(async (req, res, next) => {
-  const { id } = req.params;
-  const userId = req.userId || req.user._id.toString();
+  const { id }   = req.params;
+  const userId   = req.userId || req.user?.id;
+  const tenantId = getTenantId(req);
 
-  // Validate if the provided ID is a valid MongoDB ObjectId
   if (!mongoose.Types.ObjectId.isValid(id)) {
     return next(new AppError("Invalid Notification ID format", 400));
   }
 
-  const tenantId = getTenantId(req);
-
-  // Find the notification in the database
   const notification = await Notification.findById(id);
-
   if (!notification) {
     logger.warn(`MarkAsRead Failed: Notification ${id} not found.`);
     return next(new AppError("No notification found with that ID", 404));
@@ -154,32 +193,27 @@ const markAsRead = catchAsync(async (req, res, next) => {
 
   // Cross-tenant protection
   if (notification.tenantId && notification.tenantId !== tenantId) {
-    logger.warn(`Cross-tenant markAsRead attempt: Notification ${id} belongs to ${notification.tenantId}, requested by ${tenantId}`);
+    logger.warn(
+      `Cross-tenant markAsRead attempt: Notif ${id} belongs to ${notification.tenantId}, requested by ${tenantId}`,
+    );
     return next(new AppError("Unauthorized access to notification across tenants", 403));
   }
 
-  // If it's a private message, verify ownership and update 'isRead'
   if (notification.scope === "UNICAST") {
-    if (notification.recipientId.toString() !== userId) {
-      logger.warn(
-        `Unauthorized read attempt by User ${userId} on Notif ${id}`,
-      );
-      return next(
-        new AppError("Unauthorized access to this notification", 403),
-      );
+    if (String(notification.recipientId) !== String(userId)) {
+      logger.warn(`Unauthorized read attempt by User ${userId} on Notif ${id}`);
+      return next(new AppError("Unauthorized access to this notification", 403));
     }
     notification.isRead = true;
     await notification.save();
 
-    // Decrement cached unread count ONLY for UNICAST — this is the only scope
-    // that increments the counter at creation time. Decrementing for BROADCAST
-    // would produce a negative cached count.
+    // Decrement cached unread counter (UNICAST only)
     await redisHelper.safeDecr(`tenant:${tenantId}:user:${userId}:unread_count`);
     if (tenantId === "default") {
       await redisHelper.safeDecr(`user:${userId}:unread_count`);
     }
   } else {
-    // If it's a public message, add or update a record in NotificationReadStatus
+    // MULTICAST / BROADCAST — track per-user read state in NotificationReadStatus
     await NotificationReadStatus.updateOne(
       { tenantId, notificationId: id, userId },
       { $setOnInsert: { readAt: new Date() } },
@@ -188,32 +222,23 @@ const markAsRead = catchAsync(async (req, res, next) => {
   }
 
   logger.info(`Notification ${id} marked as read by User ${userId} [Tenant: ${tenantId}]`);
-
-  res.status(200).json({
-    status: "success",
-    message: "Marked as read successfully",
-  });
+  res.status(200).json({ status: "success", message: "Marked as read successfully" });
 });
 
-/**
- * 3. Get total unread count
- * GET /api/notifications/unread-count
- *
- * Description: Calculates how many unread messages the authenticated user has.
- */
+// ---------------------------------------------------------------------------
+// 3. Get Total Unread Count
+// GET /api/notifications/unread-count
+// ---------------------------------------------------------------------------
 const getUnreadCount = catchAsync(async (req, res, next) => {
-  const user = req.user;
-  const userId = req.userId || user._id.toString();
-
-  const userRole = user.role;
-  let userDistrict = null;
-  let userDivision = null;
-
+  const userId   = req.userId || req.user?.id;
   const tenantId = getTenantId(req);
-  const countKey = `tenant:${tenantId}:user:${userId}:unread_count`;
+
+  if (!userId) return next(new AppError("User identity missing from request.", 401));
+
+  const countKey       = `tenant:${tenantId}:user:${userId}:unread_count`;
   const legacyCountKey = `user:${userId}:unread_count`;
 
-  // 1. Check Redis Cache first (Cache-Aside Pattern)
+  // 1. Redis cache check
   let cachedCount = await redisHelper.safeGet(countKey);
   if (cachedCount === null && tenantId === "default") {
     cachedCount = await redisHelper.safeGet(legacyCountKey);
@@ -223,47 +248,18 @@ const getUnreadCount = catchAsync(async (req, res, next) => {
       status: "success",
       source: "cache",
       tenantId,
-      data: {
-        unreadCount: parseInt(cachedCount, 10),
-      },
+      data: { unreadCount: parseInt(cachedCount, 10) },
     });
   }
 
-  // 2. Cache Miss: Execute MongoDB Aggregation Pipeline
-  if (user.currentLocation?.coordinates) {
-    const [lng, lat] = user.currentLocation.coordinates;
-    const regionData = await getRegionFromCoords(lat, lng);
-    if (regionData && typeof regionData === "object") {
-      userDivision = regionData.division;
-      userDistrict = regionData.district;
-    }
-  }
+  // 2. Cache miss → aggregate from DB
+  const userTags      = await getUserTags(userId, tenantId, redisHelper);
+  const matchCriteria = buildFeedMatchCriteria(userId, userTags);
 
   const result = await Notification.aggregate([
-    {
-      $match: {
-        tenantId,
-        $or: [
-          { recipientId: mongoose.Types.ObjectId.isValid(userId) ? new mongoose.Types.ObjectId(userId) : userId },
-          { recipientRole: userRole },
-          { recipientRole: "ALL" },
-          { tags: `role:${userRole}` },
-          { tags: "role:ALL" },
-          { region: userDivision },
-          { district: userDistrict },
-          { scope: "BROADCAST" },
-        ],
-      },
-    },
-
-    {
-      $group: {
-        _id: "$_id",
-        doc: { $first: "$$ROOT" },
-      },
-    },
+    { $match: { tenantId, $or: matchCriteria } },
+    { $group: { _id: "$_id", doc: { $first: "$$ROOT" } } },
     { $replaceRoot: { newRoot: "$doc" } },
-
     {
       $lookup: {
         from: "notificationreadstatuses",
@@ -274,7 +270,7 @@ const getUnreadCount = catchAsync(async (req, res, next) => {
               $expr: {
                 $and: [
                   { $eq: ["$notificationId", "$$notifId"] },
-                  { $eq: ["$userId", new mongoose.Types.ObjectId(userId)] },
+                  { $eq: ["$userId", userId] },
                 ],
               },
             },
@@ -283,14 +279,12 @@ const getUnreadCount = catchAsync(async (req, res, next) => {
         as: "readRecord",
       },
     },
-
     { $match: { "readRecord.isDeleted": { $ne: true } } },
-
     {
       $addFields: {
         isUnread: {
           $cond: {
-            if: { $eq: ["$scope", "UNICAST"] },
+            if:   { $eq: ["$scope", "UNICAST"] },
             then: { $eq: ["$isRead", false] },
             else: { $eq: [{ $size: "$readRecord" }, 0] },
           },
@@ -303,7 +297,7 @@ const getUnreadCount = catchAsync(async (req, res, next) => {
 
   const count = result.length > 0 ? result[0].totalUnread : 0;
 
-  // 3. Cache the calculated count in Redis (1h TTL)
+  // Cache for 1 hour
   await redisHelper.safeSet(countKey, count, 3600);
   if (tenantId === "default") {
     await redisHelper.safeSet(legacyCountKey, count, 3600);
@@ -313,47 +307,32 @@ const getUnreadCount = catchAsync(async (req, res, next) => {
     status: "success",
     source: "database",
     tenantId,
-    data: {
-      unreadCount: count,
-    },
+    data: { unreadCount: count },
   });
 });
 
-/**
- * 4. Mark all notifications as read for the authenticated user
- * PATCH /api/notifications/mark-all-read
- */
+// ---------------------------------------------------------------------------
+// 4. Mark All Notifications as Read
+// PATCH /api/notifications/mark-all-read
+// ---------------------------------------------------------------------------
 const markAllAsRead = catchAsync(async (req, res, next) => {
-  const user = req.user;
-  const userId = req.userId || user._id.toString();
-
-  const { role: userRole, currentLocation } = user;
-
-  let userDistrict = null;
-  let userDivision = null;
-  if (currentLocation?.coordinates) {
-    const [lng, lat] = currentLocation.coordinates;
-    const regionData = await getRegionFromCoords(lat, lng);
-    userDivision = regionData?.division;
-    userDistrict = regionData?.district;
-  }
-
+  const userId   = req.userId || req.user?.id;
   const tenantId = getTenantId(req);
 
+  if (!userId) return next(new AppError("User identity missing from request.", 401));
+
+  // Mark owned UNICAST notifications
   await Notification.updateMany(
     { tenantId, recipientId: userId, isRead: false },
     { $set: { isRead: true } },
   );
 
-  const orConditions = [
-    { recipientRole: userRole },
-    { recipientRole: "ALL" },
-    { tags: `role:${userRole}` },
-    { tags: "role:ALL" },
-    { scope: "BROADCAST" },
-  ];
-  if (userDivision) orConditions.push({ region: userDivision });
-  if (userDistrict) orConditions.push({ district: userDistrict });
+  // Collect unread MULTICAST/BROADCAST notifications this user can see
+  const userTags   = await getUserTags(userId, tenantId, redisHelper);
+  const orConditions = [{ scope: "BROADCAST" }];
+  if (userTags.length > 0) {
+    orConditions.push({ tags: { $in: userTags } });
+  }
 
   const unreadNotifications = await Notification.aggregate([
     { $match: { tenantId, scope: { $ne: "UNICAST" }, $or: orConditions } },
@@ -367,7 +346,7 @@ const markAllAsRead = catchAsync(async (req, res, next) => {
               $expr: {
                 $and: [
                   { $eq: ["$notificationId", "$$notifId"] },
-                  { $eq: ["$userId", new mongoose.Types.ObjectId(userId)] },
+                  { $eq: ["$userId", userId] },
                 ],
               },
             },
@@ -377,73 +356,51 @@ const markAllAsRead = catchAsync(async (req, res, next) => {
       },
     },
     { $match: { "readRecord.0": { $exists: false } } },
-
     { $group: { _id: "$_id" } },
   ]);
 
   if (unreadNotifications.length > 0) {
     const bulkOps = unreadNotifications.map((n) => ({
       updateOne: {
-        filter: {
-          tenantId,
-          notificationId: n._id,
-          userId: new mongoose.Types.ObjectId(userId),
-        },
+        filter: { tenantId, notificationId: n._id, userId },
         update: { $setOnInsert: { readAt: new Date() } },
         upsert: true,
       },
     }));
 
-    await NotificationReadStatus.bulkWrite(bulkOps, { ordered: false }).catch(
-      (e) => {
-        logger.error(`Error in bulkWrite for markAllAsRead: ${e.message}`);
-      },
-    );
+    await NotificationReadStatus.bulkWrite(bulkOps, { ordered: false }).catch((e) => {
+      logger.error(`Error in bulkWrite for markAllAsRead: ${e.message}`);
+    });
   }
 
-  // Reset cached unread count in Redis to 0 (partitioned by tenantId)
+  // Reset cached unread count to 0
   await redisHelper.safeSet(`tenant:${tenantId}:user:${userId}:unread_count`, 0, 3600);
   if (tenantId === "default") {
     await redisHelper.safeSet(`user:${userId}:unread_count`, 0, 3600);
   }
 
-  res.status(200).json({
-    status: "success",
-    message: "All notifications safely marked as read",
-  });
+  res.status(200).json({ status: "success", message: "All notifications safely marked as read" });
 });
 
-/**
- * 5. Clear all notifications for the authenticated user
- * DELETE /api/notifications/clear-all-notifications
- */
+// ---------------------------------------------------------------------------
+// 5. Clear All Notifications
+// DELETE /api/notifications/clear-all-notifications
+// ---------------------------------------------------------------------------
 const clearAllNotifications = catchAsync(async (req, res, next) => {
-  const user = req.user;
-  const userId = req.userId || user._id.toString();
-
-  const { role: userRole, currentLocation } = user;
-
-  let userDistrict = null;
-  let userDivision = null;
-  if (currentLocation?.coordinates) {
-    const [lng, lat] = currentLocation.coordinates;
-    const regionData = await getRegionFromCoords(lat, lng);
-    userDivision = regionData?.division;
-    userDistrict = regionData?.district;
-  }
+  const userId   = req.userId || req.user?.id;
   const tenantId = getTenantId(req);
 
+  if (!userId) return next(new AppError("User identity missing from request.", 401));
+
+  // Delete owned UNICAST notifications
   await Notification.deleteMany({ tenantId, recipientId: userId, scope: "UNICAST" });
 
-  const orConditions = [
-    { recipientRole: userRole },
-    { recipientRole: "ALL" },
-    { tags: `role:${userRole}` },
-    { tags: "role:ALL" },
-    { scope: "BROADCAST" },
-  ];
-  if (userDivision) orConditions.push({ region: userDivision });
-  if (userDistrict) orConditions.push({ district: userDistrict });
+  // Soft-delete MULTICAST/BROADCAST read-status entries for this user
+  const userTags     = await getUserTags(userId, tenantId, redisHelper);
+  const orConditions = [{ scope: "BROADCAST" }];
+  if (userTags.length > 0) {
+    orConditions.push({ tags: { $in: userTags } });
+  }
 
   const publicNotifications = await Notification.aggregate([
     { $match: { tenantId, scope: { $ne: "UNICAST" }, $or: orConditions } },
@@ -457,7 +414,7 @@ const clearAllNotifications = catchAsync(async (req, res, next) => {
               $expr: {
                 $and: [
                   { $eq: ["$notificationId", "$$notifId"] },
-                  { $eq: ["$userId", new mongoose.Types.ObjectId(userId)] },
+                  { $eq: ["$userId", userId] },
                 ],
               },
             },
@@ -473,11 +430,7 @@ const clearAllNotifications = catchAsync(async (req, res, next) => {
   if (publicNotifications.length > 0) {
     const bulkOps = publicNotifications.map((n) => ({
       updateOne: {
-        filter: {
-          tenantId,
-          notificationId: n._id,
-          userId: new mongoose.Types.ObjectId(userId),
-        },
+        filter: { tenantId, notificationId: n._id, userId },
         update: {
           $set: { isDeleted: true, deletedAt: new Date() },
           $setOnInsert: { readAt: new Date() },
@@ -486,39 +439,34 @@ const clearAllNotifications = catchAsync(async (req, res, next) => {
       },
     }));
 
-    await NotificationReadStatus.bulkWrite(bulkOps, { ordered: false }).catch(
-      (e) => {
-        logger.error(`Error in bulkWrite for clearAll: ${e.message}`);
-      },
-    );
+    await NotificationReadStatus.bulkWrite(bulkOps, { ordered: false }).catch((e) => {
+      logger.error(`Error in bulkWrite for clearAll: ${e.message}`);
+    });
   }
 
-  // Reset cached unread count in Redis to 0 (partitioned by tenantId)
+  // Reset cached unread count to 0
   await redisHelper.safeSet(`tenant:${tenantId}:user:${userId}:unread_count`, 0, 3600);
   if (tenantId === "default") {
     await redisHelper.safeSet(`user:${userId}:unread_count`, 0, 3600);
   }
 
-  res.status(200).json({
-    status: "success",
-    message: "All notifications cleared successfully",
-  });
+  res.status(200).json({ status: "success", message: "All notifications cleared successfully" });
 });
 
-/**
- * 6. Health Check Endpoint
- * GET /api/notifications/health
- */
+// ---------------------------------------------------------------------------
+// 6. Health Check
+// GET /api/notifications/health
+// ---------------------------------------------------------------------------
 const getHealth = catchAsync(async (req, res) => {
-  const health = await getHealthStatus();
+  const health     = await getHealthStatus();
   const statusCode = health.status === "UNHEALTHY" ? 503 : 200;
   res.status(statusCode).json(health);
 });
 
-/**
- * 7. Prometheus Metrics Endpoint
- * GET /api/notifications/metrics
- */
+// ---------------------------------------------------------------------------
+// 7. Prometheus Metrics
+// GET /api/notifications/metrics
+// ---------------------------------------------------------------------------
 const getMetrics = catchAsync(async (req, res) => {
   const format = req.query.format || (req.headers.accept?.includes("json") ? "json" : "prometheus");
   if (format === "json") {

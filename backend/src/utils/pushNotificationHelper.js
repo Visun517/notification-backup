@@ -21,10 +21,21 @@ const sendPushNotification = async (target, title, body, data = {}) => {
     ),
   };
 
-  // 2. Determine the delivery method
-  // If the target name starts with "topic_", tell Firebase to broadcast it to that topic group.
-  // Otherwise, treat it as a direct device token for a single user.
-  if (target.startsWith('topic_')) {
+  // 2. Determine the delivery method.
+  //
+  // FCM device tokens are long (~140-char) alphanumeric strings.
+  // FCM topics are short, human-readable strings (tag_driver, broadcast_all, etc.).
+  //
+  // We detect topics by checking for known topic prefixes OR short length,
+  // rather than a single hardcoded prefix, so new topic naming conventions
+  // (tag_<name>, broadcast_all, etc.) are supported without touching this file.
+  const isTopic =
+    target.startsWith("topic_") || // legacy prefix — kept for backward compat
+    target.startsWith("tag_")    || // generic tag topics (new pattern)
+    target === "broadcast_all"   || // reserved broadcast topic
+    target.length < 64;            // FCM tokens are always 140+ chars
+
+  if (isTopic) {
     message.topic = target;
   } else {
     message.token = target;

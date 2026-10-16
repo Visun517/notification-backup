@@ -28,6 +28,7 @@ const {
   addDeviceToken,
   removeDeviceToken,
   updatePreferences,
+  updateSubscribedTags,
 } = require("../controllers/profileController");
 
 // Import JWT authentication middleware
@@ -101,4 +102,12 @@ router.delete("/profile/:userId/token", removeDeviceToken);
  */
 router.patch("/profile/:userId/preferences", updatePreferences);
 
+/**
+ * Route: PATCH /profile/:userId/tags
+ * Description: Host app sets or merges the user's tag subscriptions.
+ *   Body: { tags: ["colombo", "driver"], mode: "replace"|"merge" }
+ *   The engine routes MULTICAST notifications to any room whose tag appears
+ *   in this array. The host app — not the engine — decides what tags mean.
+ */
+router.patch("/profile/:userId/tags", updateSubscribedTags);
 module.exports = router;
