@@ -184,6 +184,16 @@ exports.updateSubscribedTags = catchAsync(async (req, res, next) => {
     { upsert: true, new: true, setDefaultsOnInsert: true },
   );
 
+  // Invalidate the Redis subscribedTags cache so that getNotifications() and
+  // getUnreadCount() fetch the updated tag set on the very next request.
+  // Without this, the 24-hour TTL set by getUserTags() would serve stale tags
+  // and exclude or incorrectly include notifications for up to a full day.
+  const tagCacheKey = `tenant:${tenantId}:user:${userId}:subscribedTags`;
+  await redisHelper.safeDel(tagCacheKey);
+  if (tenantId === "default") {
+    await redisHelper.safeDel(`user:${userId}:subscribedTags`);
+  }
+
   logger.info(
     `🏷️  [ProfileController] Tags updated (mode=${mode}) for User ${userId} [Tenant: ${tenantId}]: [${sanitizedTags.join(", ")}]`,
   );

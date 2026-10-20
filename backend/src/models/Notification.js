@@ -156,25 +156,10 @@ notificationSchema.pre("save", async function () {
       this.channels = [NOTIFICATION_CHANNELS.IN_APP];
     }
 
-    // Validate recipient existence for UNICAST against the engine's own registry
-    if (
-      this.scope === NOTIFICATION_SCOPES.UNICAST &&
-      this.isModified("recipientId") &&
-      this.recipientId
-    ) {
-      const NotificationProfile = mongoose.models.NotificationProfile ||
-        mongoose.model("NotificationProfile");
-      const profileExists = await NotificationProfile.exists({
-        userId: String(this.recipientId),
-      });
-      if (!profileExists) {
-        throw new Error(
-          `No NotificationProfile found for recipientId "${this.recipientId}". ` +
-          `Register the user via PATCH /api/notifications/profile/:userId/token first.`,
-        );
-      }
-    }
-
+    // NOTE: We intentionally do NOT validate NotificationProfile existence here.
+    // Early-lifecycle notifications (Welcome, OTP, password reset) are sent before
+    // a user registers an FCM token. The worker handles missing-profile cases
+    // gracefully: it skips PUSH delivery and logs a warning instead of crashing.
 
     // Clean up empty or invalid coordinates
     if (this.location) {

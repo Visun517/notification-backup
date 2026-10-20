@@ -88,10 +88,12 @@ class SocketChannelProvider extends IChannelProvider {
           }
 
           const rooms = tags.map((tag) => `tag:${tag}`);
-          rooms.forEach((room) => {
-            logger.info(`🔌 [SocketChannelProvider] MULTICAST → Room "${room}" (Notif ${_id})`);
-            io.to(room).emit("new_notification", payload);
-          });
+          // Pass the full rooms array to io.to() — Socket.io v4 deduplicates recipients
+          // internally, so a socket subscribed to multiple matching rooms still receives
+          // exactly ONE event. The old forEach emitted one packet per room, causing
+          // duplicate delivery for users in more than one matching tag room.
+          logger.info(`🔌 [SocketChannelProvider] MULTICAST → Rooms [${rooms.join(", ")}] (Notif ${_id})`);
+          io.to(rooms).emit("new_notification", payload);
 
           return { channel: this.channelName, success: true, targetRooms: rooms };
         }

@@ -25,16 +25,27 @@ const readStatusSchema = new mongoose.Schema(
       required: true,
     },
 
-    // The ID of the user who read the notification
+    // External user identity string — intentionally plain String to match
+    // Notification.recipientId and NotificationProfile.userId.
+    // Supports any auth system (MongoDB ObjectId, UUID, Clerk ID, Auth0 sub, etc.)
+    // DO NOT change to ObjectId — the $expr pipeline comparison would silently fail.
     userId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
+      type: String,
       required: true,
+      index: true,
     },
+
     isDeleted: {
-      type: Boolean,  
+      type: Boolean,
       default: false,
     },
+
+    // Populated only when isDeleted is set via clearAllNotifications
+    deletedAt: {
+      type: Date,
+      default: null,
+    },
+
     // The exact time the user opened/read the message
     readAt: {
       type: Date,

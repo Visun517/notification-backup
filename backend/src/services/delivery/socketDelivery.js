@@ -43,11 +43,12 @@ exports.deliverViaSocket = (io, notification) => {
         break;
       }
 
-      for (const tag of tags) {
-        const room = `tag:${tag}`;
-        logger.info(`📡 [Socket] MULTICAST → Room "${room}" (Notif ${_id})`);
-        io.to(room).emit("new_notification", notification);
-      }
+      const rooms = tags.map((tag) => `tag:${tag}`);
+      // Pass the full array to io.to() — Socket.io v4 deduplicates at the wire
+      // level, so a socket subscribed to multiple matching rooms still receives
+      // exactly ONE event instead of one per room.
+      logger.info(`📡 [Socket] MULTICAST → Rooms [${rooms.join(", ")}] (Notif ${_id})`);
+      io.to(rooms).emit("new_notification", notification);
       break;
     }
 

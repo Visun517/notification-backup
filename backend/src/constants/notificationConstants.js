@@ -1,6 +1,10 @@
 /**
  * Enterprise Notification Constants
  * Generic, domain-agnostic definitions for multi-channel notification engine.
+ *
+ * Audience targeting is handled exclusively through dynamic string tags
+ * (e.g. notification.tags: ["role:driver", "tier:gold", "region:south"]).
+ * No hardcoded domain roles, geo-locations, or project-specific enums live here.
  */
 
 /**
@@ -49,32 +53,9 @@ const NOTIFICATION_STATUSES = {
   FAILED: "FAILED",
 };
 
-/**
- * Legacy application roles preserved for backward compatibility with User model.
- * Note: New notification features should use dynamic 'tags' (e.g. ['role:driver', 'tier:gold']) instead of hardcoded enums.
- */
-const RECIPIENT_ROLES = {
-  TOURIST: "TOURIST",
-  DRIVER: "DRIVER",
-  VEHICLE_OWNER: "VEHICLE_OWNER",
-  HOTEL_OWNER: "HOTEL_OWNER",
-  RESTAURANT_OWNER: "RESTAURANT_OWNER",
-  LOCAL_FOOD_PROVIDER: "LOCAL_FOOD_PROVIDER",
-  SURF_INSTRUCTOR: "SURF_INSTRUCTOR",
-  TRAVEL_AGENCY: "TRAVEL_AGENCY",
-  DESTINATION_MANAGER: "DESTINATION_MANAGER",
-  SAFETY_MANAGER: "SAFETY_MANAGER",
-  SYSTEM_ADMIN: "SYSTEM_ADMIN",
-  ADVERTISER: "ADVERTISER",
-  EMERGENCY_PROVIDER: "EMERGENCY_PROVIDER",
-  EVENT_ORGANIZER: "EVENT_ORGANIZER",
-  ALL: "ALL",
-};
-
 module.exports = {
   NOTIFICATION_CHANNELS,
   NOTIFICATION_SCOPES,
   NOTIFICATION_PRIORITIES,
   NOTIFICATION_STATUSES,
-  RECIPIENT_ROLES,
 };
