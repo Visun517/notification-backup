@@ -6,7 +6,7 @@ const { Server } = require("socket.io");
 const notificationHandler = require("./socket/notificationHandler");
 const notificationRoutes = require("./src/routes/notificationRoutes.js");
 const globalErrorHandler = require("./src/middleware/errorMiddleware");
-require("./src/configs/firebaseConfig");
+require("./src/config/firebaseConfig");
 const socketAuth = require("./src/middleware/socketAuthMiddleware");
 const cors = require("cors");
 
