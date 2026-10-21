@@ -18,6 +18,10 @@ const { templateEngine, TemplateEngine } = require("./utils/TemplateEngine");
 const { telemetry, TelemetryService } = require("./utils/telemetry");
 const { getHealthStatus } = require("./utils/healthCheck");
 const { rateLimiter, RateLimiter, checkRateLimit } = require("./utils/rateLimiter");
+const createRateLimiter = require("./middleware/rateLimitMiddleware");
+const { apiRateLimiter, strictRateLimiter } = createRateLimiter;
+const validate = require("./middleware/validate");
+const notificationValidator = require("./validators/notificationValidator");
 const { notificationQueue, deadLetterQueue, enqueueNotification } = require("./queues/notificationQueue");
 const { startNotificationWorker, stopNotificationWorker } = require("./workers/notificationWorker");
 const Notification = require("./models/Notification");
@@ -56,6 +60,11 @@ module.exports = {
   rateLimiter,
   RateLimiter,
   checkRateLimit,
+  createRateLimiter,
+  apiRateLimiter,
+  strictRateLimiter,
+  validate,
+  notificationValidator,
 
   // BullMQ Queues & Worker Management
   notificationQueue,

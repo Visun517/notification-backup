@@ -16,10 +16,6 @@ build/
 
 # OS related files
 .DS_Store
-Thumbs.db
-
-firebase-service-account.json
-
 logs/
 
 # Firebase credentials

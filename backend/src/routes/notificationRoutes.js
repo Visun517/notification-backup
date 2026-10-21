@@ -1,15 +1,24 @@
 /**
  * Notification Routes
  *
- * Description:
- * This file defines the API endpoints (URL paths) for the notification system.
- * All notification endpoints are protected by cryptographic JWT authentication middleware.
+ * All routes are secured with JWT authentication (enforce via `protect`).
+ * Public telemetry probes (/health, /metrics) are intentionally excluded from auth.
+ *
+ * Middleware stack per route (applied left-to-right):
+ *   protect           — JWT bearer token verification
+ *   [rateLimiter]     — Redis atomic sliding-window frequency cap
+ *   validate(...)     — Zod schema validation of params / body
+ *   [controller]      — Business logic handler
+ *
+ * Rate Limiter Policy:
+ *   apiRateLimiter    — General endpoints: 100 req / 60s per identity
+ *   strictRateLimiter — Sensitive / mutation endpoints: 10 req / 60s per identity
  */
 
 const express = require("express");
 const router = express.Router();
 
-// Import the main notification logic (Controllers)
+// ── Controllers ──────────────────────────────────────────────────────────────
 const {
   getNotifications,
   markAsRead,
@@ -20,10 +29,8 @@ const {
   getMetrics,
 } = require("../controllers/notificationController");
 
-// Import the testing/simulation controller
 const { triggerSimulation } = require("../controllers/exampleController");
 
-// Import the decoupled Subscription Registry (profile) controller
 const {
   addDeviceToken,
   removeDeviceToken,
@@ -31,83 +38,156 @@ const {
   updateSubscribedTags,
 } = require("../controllers/profileController");
 
-// Import JWT authentication middleware
-const protect = require("../middleware/authMiddleware");
+// ── Auth middleware ───────────────────────────────────────────────────────────
+const protect = require("./authMiddleware");
 
-/**
- * Public Telemetry & Health Monitoring Probes
- */
-router.get("/health", getHealth);
+// ── Rate limiters ─────────────────────────────────────────────────────────────
+const {
+  apiRateLimiter,
+  strictRateLimiter,
+} = require("./rateLimitMiddleware");
+
+// ── Validation middleware & schemas ───────────────────────────────────────────
+const validate = require("./validate");
+const {
+  addDeviceTokenBodySchema,
+  removeDeviceTokenBodySchema,
+  updatePreferencesBodySchema,
+  updateSubscribedTagsBodySchema,
+  triggerSimulationBodySchema,
+  userIdParamsSchema,
+} = require("../validators/notificationValidator");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUBLIC — Telemetry & Health Probes
+// No auth or rate limiting: these are called by infrastructure (K8s, Prometheus).
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/health",  getHealth);
 router.get("/metrics", getMetrics);
 
-// Enforce JWT authentication on remaining user notification routes
+// ─────────────────────────────────────────────────────────────────────────────
+// Enforce JWT authentication on all routes below this line.
+// ─────────────────────────────────────────────────────────────────────────────
 router.use(protect);
 
-/**
- * Route: GET /
- * Description: Fetches all notifications (with pagination) for the authenticated user.
- */
-router.get("/", getNotifications);
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTIFICATION FEED  (read-heavy — standard rate limit)
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Route: GET /unread-count
- * Description: Gets the total number of messages that the authenticated user has not read yet.
+ * GET /
+ * Fetches paginated notification feed for the authenticated user.
  */
-router.get("/unread-count", getUnreadCount);
+router.get("/", apiRateLimiter, getNotifications);
 
 /**
- * Route: PATCH /:id/read
- * Description: Marks a specific notification as "read" for the authenticated user.
+ * GET /unread-count
+ * Returns the total number of unread notifications for the authenticated user.
  */
-router.patch("/:id/read", markAsRead);
+router.get("/unread-count", apiRateLimiter, getUnreadCount);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTIFICATION STATE MUTATIONS  (strict rate limit — prevent bulk abuse)
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Route: PATCH /mark-all-read
- * Description: Marks all notifications as read for the authenticated user.
+ * PATCH /:id/read
+ * Marks a specific notification as read for the authenticated user.
  */
-router.patch("/mark-all-read", markAllAsRead);
+router.patch("/:id/read", strictRateLimiter, markAsRead);
 
 /**
- * Route: DELETE /clear-all-notifications
- * Description: Clears/deletes all notifications for the authenticated user.
+ * PATCH /mark-all-read
+ * Marks every notification as read for the authenticated user.
  */
-router.delete("/clear-all-notifications", clearAllNotifications);
+router.patch("/mark-all-read", strictRateLimiter, markAllAsRead);
 
 /**
- * Route: POST /simulate-system-update
- * Description: Testing route to simulate notification events.
+ * DELETE /clear-all-notifications
+ * Soft-deletes all notifications for the authenticated user.
  */
-router.post("/simulate-system-update", triggerSimulation);
+router.delete("/clear-all-notifications", strictRateLimiter, clearAllNotifications);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIMULATION  (strict rate limit + Zod validation — privileged operation)
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Subscription Registry — Notification Profile Management.
+ * POST /simulate-system-update
+ * Triggers a test notification dispatch. Requires `type` and `scenario`.
+ */
+router.post(
+  "/simulate-system-update",
+  strictRateLimiter,
+  validate(triggerSimulationBodySchema),
+  triggerSimulation,
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUBSCRIPTION REGISTRY — Notification Profile Management
+//
+// These routes mutate user device tokens, preferences, and tag subscriptions.
+// All are strictly rate-limited and Zod-validated.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * PATCH /profile/:userId/token
+ * Registers a new FCM device token (idempotent via $addToSet).
  *
- * These routes manage the engine's decoupled NotificationProfile,
- * replacing the previous tight coupling to the host app's User model.
+ * Middleware stack:
+ *   strictRateLimiter → validate(body, null, params) → addDeviceToken
+ */
+router.patch(
+  "/profile/:userId/token",
+  strictRateLimiter,
+  validate(addDeviceTokenBodySchema, null, userIdParamsSchema),
+  addDeviceToken,
+);
+
+/**
+ * DELETE /profile/:userId/token
+ * Removes a specific FCM token on logout or token rotation.
  *
- * Route: PATCH /profile/:userId/token
- * Description: Registers a new FCM device token for the user (idempotent via $addToSet).
+ * Middleware stack:
+ *   strictRateLimiter → validate(body, null, params) → removeDeviceToken
  */
-router.patch("/profile/:userId/token", addDeviceToken);
+router.delete(
+  "/profile/:userId/token",
+  strictRateLimiter,
+  validate(removeDeviceTokenBodySchema, null, userIdParamsSchema),
+  removeDeviceToken,
+);
 
 /**
- * Route: DELETE /profile/:userId/token
- * Description: Removes a specific FCM token from the user's device list (e.g. on logout).
+ * PATCH /profile/:userId/preferences
+ * Updates the user's per-channel notification opt-in preferences.
+ *
+ * Middleware stack:
+ *   strictRateLimiter → validate(body, null, params) → updatePreferences
  */
-router.delete("/profile/:userId/token", removeDeviceToken);
+router.patch(
+  "/profile/:userId/preferences",
+  strictRateLimiter,
+  validate(updatePreferencesBodySchema, null, userIdParamsSchema),
+  updatePreferences,
+);
 
 /**
- * Route: PATCH /profile/:userId/preferences
- * Description: Updates the user's per-channel notification preferences.
+ * PATCH /profile/:userId/tags
+ * Sets or merges the user's tag subscriptions.
+ *   Body: { tags: string[], mode: "replace" | "merge" }
+ *
+ * Middleware stack:
+ *   apiRateLimiter → validate(body, null, params) → updateSubscribedTags
+ *
+ * Note: Tag updates use apiRateLimiter (not strict) because the host app
+ * may call this frequently on session refresh (e.g., user changes location).
  */
-router.patch("/profile/:userId/preferences", updatePreferences);
+router.patch(
+  "/profile/:userId/tags",
+  apiRateLimiter,
+  validate(updateSubscribedTagsBodySchema, null, userIdParamsSchema),
+  updateSubscribedTags,
+);
 
-/**
- * Route: PATCH /profile/:userId/tags
- * Description: Host app sets or merges the user's tag subscriptions.
- *   Body: { tags: ["colombo", "driver"], mode: "replace"|"merge" }
- *   The engine routes MULTICAST notifications to any room whose tag appears
- *   in this array. The host app — not the engine — decides what tags mean.
- */
-router.patch("/profile/:userId/tags", updateSubscribedTags);
 module.exports = router;
