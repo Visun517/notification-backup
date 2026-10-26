@@ -28,6 +28,8 @@ const Notification = require("./models/Notification");
 const NotificationReadStatus = require("./models/NotificationReadStatus");
 const NotificationProfile = require("./models/NotificationProfile");
 const notificationRoutes = require("./routes/notificationRoutes");
+const adminRoutes = require("./routes/adminRoutes");
+const { retryDlqJobs } = require("./controllers/adminController");
 const {
   NOTIFICATION_CHANNELS,
   NOTIFICATION_PRIORITIES,
@@ -84,6 +86,8 @@ module.exports = {
   NOTIFICATION_SCOPES,
   NOTIFICATION_STATUSES,
 
-  // Express Routes
+  // Express Routes & Admin Controllers
   notificationRoutes,
+  adminRoutes,
+  retryDlqJobs,
 };

@@ -113,7 +113,7 @@ async function enqueueNotification(notification, options = {}) {
       channels: notification.channels,
       priority,
     });
-  } catch (_) {}
+  } catch (_) { }
 
   logger.info(`📥 [NotificationQueue] Enqueued notification ${notifId} [Tenant: ${tenantId}] (Job ID: ${job.id}, Priority: ${priority})`);
   return job;

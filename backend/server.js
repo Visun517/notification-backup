@@ -5,6 +5,7 @@ const mongoose = require("mongoose");
 const { Server } = require("socket.io");
 const notificationHandler = require("./socket/notificationHandler");
 const notificationRoutes = require("./src/routes/notificationRoutes.js");
+const adminRoutes = require("./src/routes/adminRoutes.js");
 const globalErrorHandler = require("./src/middleware/errorMiddleware");
 require("./src/config/firebaseConfig");
 const socketAuth = require("./src/middleware/socketAuthMiddleware");
@@ -101,6 +102,7 @@ app.get("/health/notifications", async (req, res) => {
 });
 
 app.use("/api/notifications", notificationRoutes);
+app.use("/api/admin", adminRoutes);
 
 // --- NOTIFICATION ENGINE SETUP END ---
 
