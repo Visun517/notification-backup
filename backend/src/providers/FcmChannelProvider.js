@@ -1,13 +1,12 @@
 const IChannelProvider = require("./IChannelProvider");
 const { NOTIFICATION_CHANNELS } = require("../constants/notificationConstants");
-const sendPush = require("../utils/pushNotificationHelper");
 const NotificationProfile = require("../models/NotificationProfile");
+const sendPush = require("../utils/pushNotificationHelper");
 const logger = require("../utils/logger");
 
 /**
  * Sanitize a tag string into a valid FCM topic component.
  * FCM topics allow: letters, digits, hyphens, underscores, tildes, percent.
- * Mirrors the sanitizeTag() helpers in fcmService.js and pushDelivery.js.
  *
  * @param {string} tag
  * @returns {string}
@@ -15,21 +14,32 @@ const logger = require("../utils/logger");
 const sanitizeTag = (tag) => tag.replace(/[^a-zA-Z0-9-_.~%]/g, "_");
 
 /**
+ * Build a prefixed FCM topic name from a generic tag string.
+ * The "tag_" prefix lets pushNotificationHelper identify this as a topic
+ * (not a device token) and route it via messaging().send({ topic }).
+ *
+ * @param {string} tag  e.g. "driver", "region:south", "premium"
+ * @returns {string}    e.g. "tag_driver", "tag_region_south", "tag_premium"
+ */
+const toFcmTopic = (tag) => `tag_${sanitizeTag(tag)}`;
+
+/**
  * FcmChannelProvider — Concrete Strategy for PUSH notifications.
  *
  * Delivers mobile push notifications via Firebase Cloud Messaging (FCM).
- * Routing is 100% domain-agnostic and mirrors FcmDelivery / socketDelivery:
+ * Routing is 100% domain-agnostic:
  *
  *   UNICAST   → send to every FCM token registered for the recipient user
- *               (all tokens fetched from NotificationProfile — multi-device)
+ *               (all tokens fetched from NotificationProfile — multi-device support)
  *   MULTICAST → fan-out to one FCM topic per tag in notification.tags
- *               Topic naming: "tag_<tagName>"
+ *               Topic naming: "tag_<tagName>" (underscores, no colons/spaces)
  *               Users subscribe to these topics on socket connect via
  *               notificationHandler.js → fcmService.manageTagTopics()
  *   BROADCAST → send to the reserved "broadcast_all" FCM topic
- *               All users auto-subscribe to this topic on socket connect
+ *               All users auto-subscribe to this topic on connect
  *
  * No geography, roles, regions, or districts anywhere in this file.
+ * The host application controls audience targeting exclusively through tags.
  */
 class FcmChannelProvider extends IChannelProvider {
   constructor() {
@@ -59,17 +69,19 @@ class FcmChannelProvider extends IChannelProvider {
       tenantId = "default",
     } = payload;
 
+    // Invisible data payload sent alongside the visible push notification.
+    // FCM requires all values to be strings.
     const pushData = {
-      url: String(actionUrl),
+      url: String(actionUrl || ""),
       notificationId: String(_id || ""),
     };
 
     try {
       switch (scope) {
-        // -----------------------------------------------------------------
-        // UNICAST — send to every FCM token registered for the target user.
-        // Multi-device: all tokens from NotificationProfile are targeted.
-        // -----------------------------------------------------------------
+        // ---------------------------------------------------------------------
+        // UNICAST — direct message to one specific user.
+        // Sends to every FCM token the user has registered (multi-device support).
+        // ---------------------------------------------------------------------
         case "UNICAST": {
           // Allow override via recipientMeta (e.g. worker passes cached token)
           let fcmTokens = recipientMeta.fcmToken ? [recipientMeta.fcmToken] : null;
@@ -84,7 +96,7 @@ class FcmChannelProvider extends IChannelProvider {
 
           if (!fcmTokens.length) {
             logger.warn(
-              `⚠️ [FcmChannelProvider] UNICAST skipped: no FCM tokens for User ${recipientId} [Tenant: ${tenantId}]`,
+              `⚠️ [FcmChannelProvider] UNICAST skipped: no FCM tokens registered for User ${recipientId} [Tenant: ${tenantId}]`,
             );
             return {
               channel: this.channelName,
@@ -103,18 +115,19 @@ class FcmChannelProvider extends IChannelProvider {
           logger.info(
             `📲 [FcmChannelProvider] UNICAST → User ${recipientId} (${fcmTokens.length} device(s)) [Notif ${_id}]`,
           );
+
           return {
             channel: this.channelName,
             success: anySuccess,
             messageId: results.find((r) => r.messageId)?.messageId,
+            error: anySuccess ? undefined : results[0]?.error,
           };
         }
 
-        // -----------------------------------------------------------------
-        // MULTICAST — fan-out to one FCM topic per tag in notification.tags.
-        // "tag_<tagName>" topics are kept in sync with socket rooms via
-        // notificationHandler → fcmService.manageTagTopics on connect.
-        // -----------------------------------------------------------------
+        // ---------------------------------------------------------------------
+        // MULTICAST — fan-out to every FCM topic matching the notification's tags.
+        // Each tag in notification.tags maps to an FCM topic "tag_<tagName>".
+        // ---------------------------------------------------------------------
         case "MULTICAST": {
           if (!tags.length) {
             logger.warn(
@@ -127,12 +140,14 @@ class FcmChannelProvider extends IChannelProvider {
             };
           }
 
-          const topics = tags.map((tag) => `tag_${sanitizeTag(tag)}`);
+          const topics = tags.map(toFcmTopic);
           const results = [];
 
           for (const topic of topics) {
             const r = await sendPush(topic, title, message, pushData);
-            logger.info(`📡 [FcmChannelProvider] MULTICAST → FCM Topic "${topic}" [Notif ${_id}]`);
+            logger.info(
+              `📲 [FcmChannelProvider] MULTICAST → FCM Topic "${topic}" [Notif ${_id}]`,
+            );
             results.push({ topic, ...r });
           }
 
@@ -141,17 +156,20 @@ class FcmChannelProvider extends IChannelProvider {
             channel: this.channelName,
             success: anySuccess,
             targetTopics: topics,
+            error: anySuccess ? undefined : results[0]?.error,
           };
         }
 
-        // -----------------------------------------------------------------
-        // BROADCAST — send to the reserved "broadcast_all" FCM topic.
-        // All users auto-subscribe to this topic on socket connect.
-        // -----------------------------------------------------------------
+        // ---------------------------------------------------------------------
+        // BROADCAST — platform-wide push to every registered device.
+        // Sends to the reserved "broadcast_all" FCM topic.
+        // ---------------------------------------------------------------------
         case "BROADCAST": {
           const topic = "broadcast_all";
           const result = await sendPush(topic, title, message, pushData);
-          logger.info(`📢 [FcmChannelProvider] BROADCAST → FCM Topic "${topic}" [Notif ${_id}]`);
+          logger.info(
+            `📲 [FcmChannelProvider] BROADCAST → FCM Topic "${topic}" [Notif ${_id}]`,
+          );
           return {
             channel: this.channelName,
             success: result.success,
@@ -162,7 +180,9 @@ class FcmChannelProvider extends IChannelProvider {
         }
 
         default:
-          logger.warn(`⚠️ [FcmChannelProvider] Unknown scope "${scope}" for Notif ${_id}.`);
+          logger.warn(
+            `⚠️ [FcmChannelProvider] Unknown scope "${scope}" for Notif ${_id} — no FCM delivery attempted.`,
+          );
           return {
             channel: this.channelName,
             success: false,
@@ -170,8 +190,14 @@ class FcmChannelProvider extends IChannelProvider {
           };
       }
     } catch (error) {
-      logger.error(`❌ [FcmChannelProvider] Delivery failure for Notif ${_id}: ${error.message}`);
-      return { channel: this.channelName, success: false, error: error.message };
+      logger.error(
+        `❌ [FcmChannelProvider] FCM delivery failed for Notif ${_id}: ${error.message}`,
+      );
+      return {
+        channel: this.channelName,
+        success: false,
+        error: error.message,
+      };
     }
   }
 }

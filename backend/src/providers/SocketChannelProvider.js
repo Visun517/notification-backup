@@ -6,7 +6,7 @@ const logger = require("../utils/logger");
  * SocketChannelProvider — Concrete Strategy for IN_APP / Real-time delivery.
  *
  * Delivers real-time notifications via Socket.io rooms. Routing is
- * 100% domain-agnostic and mirrors socketDelivery.js exactly:
+ * 100% domain-agnostic:
  *
  *   UNICAST   → private room  "user_<recipientId>"
  *   MULTICAST → one "tag:<name>" room per tag in notification.tags
