@@ -95,7 +95,7 @@ startNotificationWorker();
  * This handles fetching message history, marking messages as read, and unread counts.
  */
 const { getHealthStatus } = require("./src/utils/healthCheck");
-app.get("/health/notifications", async (req, res) => {
+app.get(" ", async (req, res) => {
   const health = await getHealthStatus();
   const statusCode = health.status === "UNHEALTHY" ? 503 : 200;
   res.status(statusCode).json(health);

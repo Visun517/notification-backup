@@ -39,16 +39,16 @@ const {
 } = require("../controllers/profileController");
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
-const protect = require("./authMiddleware");
+const protect = require("../middleware/authMiddleware");
 
 // ── Rate limiters ─────────────────────────────────────────────────────────────
 const {
   apiRateLimiter,
   strictRateLimiter,
-} = require("./rateLimitMiddleware");
+} = require("../middleware/rateLimitMiddleware");
 
 // ── Validation middleware & schemas ───────────────────────────────────────────
-const validate = require("./validate");
+const validate = require("../middleware/validate");
 const {
   addDeviceTokenBodySchema,
   removeDeviceTokenBodySchema,
@@ -62,7 +62,7 @@ const {
 // PUBLIC — Telemetry & Health Probes
 // No auth or rate limiting: these are called by infrastructure (K8s, Prometheus).
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/health",  getHealth);
+router.get("/health", getHealth);
 router.get("/metrics", getMetrics);
 
 // ─────────────────────────────────────────────────────────────────────────────
