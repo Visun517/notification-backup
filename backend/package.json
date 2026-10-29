@@ -10,8 +10,8 @@
     "./constants": "./src/constants/notificationConstants.js"
   },
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js",
+    "start": "node init && node server.js",
+    "dev": "node init && nodemon server.js",
     "test": "node --test"
   },
   "keywords": [
