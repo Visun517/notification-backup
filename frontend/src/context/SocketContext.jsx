@@ -20,7 +20,6 @@ import {
 } from "../store/selectors/authSelectors";
 
 // Utils & API
-import calculateDistance from "../utils/geoutils";
 import { triggerSafetyFeedback } from "../utils/feedbackHelper";
 import { requestForToken } from "../utils/firebase";
 import { updateFCMTokenApi } from "../api/userApi";
@@ -47,29 +46,37 @@ export const SocketProvider = ({ children }) => {
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
 
   useEffect(() => {
-    let watchId = null;
-
     if (user?._id && token) {
       dispatch(clearNotifications());
 
-      requestForToken().then((fcmToken) => {
-        if (fcmToken) {
-          updateFCMTokenApi(user._id, fcmToken)
-            .then(() => console.log("✅ FCM Token saved in DB successfully!"))
-            .catch((err) => console.error("❌ Failed to save FCM Token:", err));
-        }
-      });
+      // Register FCM device token
+      requestForToken()
+        .then((fcmToken) => {
+          if (fcmToken) {
+            updateFCMTokenApi(user._id, fcmToken)
+              .then(() => console.log("✅ FCM Token saved in DB successfully!"))
+              .catch((err) => console.error("❌ Failed to save FCM Token:", err));
+          }
+        })
+        .catch((err) => console.error("⚠️ Failed to request FCM token:", err));
 
       const SOCKET_URL =
         import.meta.env.VITE_SOCKET_URL || "http://localhost:5000";
 
+      // Initialize Socket.io client with auth payload and headers
       socketRef.current = io(SOCKET_URL, {
-        auth: { token },
+        auth: {
+          token,
+        },
+        extraHeaders: {
+          Authorization: token.startsWith("Bearer ") ? token : `Bearer ${token}`,
+          token,
+        },
         reconnection: true,
         reconnectionAttempts: Infinity,
         reconnectionDelay: 2000,
         reconnectionDelayMax: 5000,
-        transports: ["polling", "websocket"],
+        transports: ["websocket", "polling"],
       });
 
       const socket = socketRef.current;
@@ -116,32 +123,8 @@ export const SocketProvider = ({ children }) => {
       socket.on("reconnect_attempt", handleReconnectAttempt);
       socket.on("new_notification", handleNewNotification);
 
-      if ("geolocation" in navigator) {
-        let lastLat = null;
-        let lastLng = null;
-
-        watchId = navigator.geolocation.watchPosition(
-          (position) => {
-            const { latitude, longitude } = position.coords;
-
-            if (lastLat && lastLng) {
-              const dist = calculateDistance(lastLat, lastLng, latitude, longitude);
-              if (dist < 50) return;
-            }
-
-            lastLat = latitude;
-            lastLng = longitude;
-
-            socket.emit("update_location", { lat: latitude, lng: longitude });
-          },
-          (err) => console.warn("⚠️ GPS Error:", err.message),
-          { enableHighAccuracy: true, distanceFilter: 50 },
-        );
-      }
-
       return () => {
-        console.log("🧹 Cleaning up Socket & GPS...");
-        if (watchId) navigator.geolocation.clearWatch(watchId);
+        console.log("🧹 Cleaning up Socket connection...");
         socket.off("connect", handleConnect);
         socket.off("disconnect", handleDisconnect);
         socket.off("connect_error", handleConnectError);
@@ -154,6 +137,7 @@ export const SocketProvider = ({ children }) => {
 
     return undefined;
   }, [user?._id, token, dispatch, queryClient]);
+
   return (
     <SocketContext.Provider
       value={{ socket: socketRef.current, connectionStatus, reconnectAttempt }}

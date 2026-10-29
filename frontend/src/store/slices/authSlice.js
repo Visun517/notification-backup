@@ -9,7 +9,7 @@ const authSlice = createSlice({
       fullName: "Test Driver",
     },
     token:
-      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjZhMzI4OGEyOWE3M2E0YzE0NjE2ZWQwMCIsImlhdCI6MTUxNjIzOTAyMn0.HrtB8Fte0OVtkGovF0K7Xs3Yu--PGSSj35Bhe9iEyFU",
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjZhMzI4OGEyOWE3M2E0YzE0NjE2ZWQwMCIsInJvbGUiOiJBRE1JTiIsImlhdCI6MTc5MzIwMTg5NSwiZXhwIjoxNzk1NzkzODk1fQ.gf1Z6S95Qhe_61GjnyVQ1n7LYB1I34utNr0IGBCSDLc",
     isAuthenticated: true,
   },
   reducers: {

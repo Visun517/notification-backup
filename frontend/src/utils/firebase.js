@@ -21,21 +21,50 @@ if (typeof window !== "undefined" && "serviceWorker" in navigator) {
 const VAPID_KEY = import.meta.env.VITE_FIREBASE_VAPID_KEY;
 
 export const requestForToken = async () => {
-  if (!messaging) return null;
+  if (
+    typeof window === "undefined" ||
+    !("serviceWorker" in navigator) ||
+    !messaging
+  ) {
+    return null;
+  }
 
   try {
-    const currentToken = await getToken(messaging, { vapidKey: VAPID_KEY });
+    // 1. Explicitly check / request browser notification permission
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") {
+      console.warn(
+        "⚠️ Notification permission not granted. Status:",
+        permission
+      );
+      return null;
+    }
+
+    // 2. Explicitly register the service worker with root scope to prevent race conditions
+    const registration = await navigator.serviceWorker.register(
+      "/firebase-messaging-sw.js",
+      { scope: "/" }
+    );
+    await navigator.serviceWorker.ready;
+
+
+    // 3. Obtain FCM token bound to the active service worker registration
+    const currentToken = await getToken(messaging, {
+      vapidKey: VAPID_KEY,
+      serviceWorkerRegistration: registration,
+    });
+
     if (currentToken) {
-      console.log("✅ Firebase FCM Token Generated:", currentToken);
+      //console.log("✅ Firebase FCM Token Generated:", currentToken);
       return currentToken;
     } else {
-      console.log(
-        "No registration token available. Request permission to generate one.",
+      console.warn(
+        "⚠️ No registration token available. Check Web Push certificates in Firebase Console."
       );
       return null;
     }
   } catch (err) {
-    console.error("An error occurred while retrieving token:", err);
+    console.error("❌ An error occurred while retrieving token:", err);
     return null;
   }
 };
