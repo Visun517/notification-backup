@@ -43,6 +43,22 @@ async function processNotificationJob(job) {
     telemetry.recordQueueWaitTime({ tenantId, durationMs: queueWaitMs });
   } catch (_) {}
 
+    try {
+    const { emitLiveLog } = require("../utils/adminLogEmitter");
+    emitLiveLog({
+      level: "INFO",
+      event: "JOB_PROCESSING",
+      message: `Worker thread started processing Job ${job.id} for Notification ${notificationId} (Attempt: ${job.attemptsMade + 1})`,
+      tenantId,
+      details: {
+        jobId: job.id,
+        notificationId,
+        channels: targetChannels,
+        queueWaitMs,
+      },
+    });
+  } catch (_) {}
+
   logger.info(`⚙️ [NotificationWorker] Processing Job ${job.id} [Tenant: ${tenantId}] for Notification: ${notificationId} (Attempt: ${job.attemptsMade + 1})`);
 
   // 1. Update status in Database to PROCESSING
@@ -188,6 +204,25 @@ async function processNotificationJob(job) {
     }
   }
 
+    try {
+    const { emitLiveLog } = require("../utils/adminLogEmitter");
+    const isSuccess = finalStatus === NOTIFICATION_STATUSES.DELIVERED;
+    const isPartial = finalStatus === NOTIFICATION_STATUSES.PARTIAL;
+    emitLiveLog({
+      level: isSuccess ? "SUCCESS" : isPartial ? "WARN" : "ERROR",
+      event: isSuccess ? "NOTIFICATION_DELIVERED" : isPartial ? "NOTIFICATION_PARTIAL" : "NOTIFICATION_FAILED",
+      message: `Notification ${notificationId} dispatched with status ${finalStatus} (${successCount} succeeded, ${failureCount} failed)`,
+      tenantId,
+      details: {
+        notificationId,
+        status: finalStatus,
+        successCount,
+        failureCount,
+        dispatchResults,
+      },
+    });
+  } catch (_) {}
+
   // 4. If all channels failed and we still have retry attempts remaining, throw an error to trigger BullMQ retry
   if (successCount === 0 && failureCount > 0) {
     throw new Error(`All target delivery channels failed for notification ${notificationId}`);
@@ -221,6 +256,28 @@ function startNotificationWorker() {
   });
 
   notificationWorker.on("failed", async (job, err) => {
+    try {
+      const { emitLiveLog } = require("../utils/adminLogEmitter");
+      const isDlq = job.attemptsMade >= job.opts.attempts;
+      const tenantId = job.data?.tenantId || "default";
+      const notificationId = job.data?.notificationId;
+      emitLiveLog({
+        level: "ERROR",
+        event: isDlq ? "ROUTED_TO_DLQ" : "JOB_FAILED",
+        message: isDlq
+          ? `Job ${job.id} exceeded maximum retry budget and was moved to Dead-Letter Queue (DLQ)`
+          : `Job ${job.id} failed attempt ${job.attemptsMade}/${job.opts.attempts}: ${err.message}`,
+        tenantId,
+        details: {
+          jobId: job.id,
+          notificationId,
+          error: err.message,
+          attemptsMade: job.attemptsMade,
+          maxAttempts: job.opts.attempts,
+          routedToDlq: isDlq,
+        },
+      });
+    } catch (_) {}
     logger.error(`❌ [NotificationWorker] Job ${job.id} failed (Attempt ${job.attemptsMade}/${job.opts.attempts}): ${err.message}`);
 
     // If job exceeded maximum attempts, route to Dead-Letter Queue (DLQ)

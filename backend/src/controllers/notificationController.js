@@ -476,6 +476,286 @@ const getMetrics = catchAsync(async (req, res) => {
   res.status(200).send(telemetry.getPrometheusMetrics());
 });
 
+
+// ---------------------------------------------------------------------------
+// 8. Admin Dashboard Overview
+// GET /api/notifications/overview
+// ---------------------------------------------------------------------------
+const getOverview = catchAsync(async (req, res) => {
+  const tenantId = req.query?.tenantId || req.user?.tenantId || "default";
+
+  const now = new Date();
+  const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+  // 1. Queue Statistics from BullMQ
+  const queueStats = {
+    waiting: 0,
+    active: 0,
+    completed: 0,
+    failed: 0,
+    delayed: 0,
+    dlqCount: 0,
+  };
+
+  try {
+    const { notificationQueue, deadLetterQueue } = require("../queues/notificationQueue");
+    if (notificationQueue) {
+      const counts = await notificationQueue.getJobCounts(
+        "waiting",
+        "active",
+        "completed",
+        "failed",
+        "delayed"
+      );
+      queueStats.waiting = counts.waiting || 0;
+      queueStats.active = counts.active || 0;
+      queueStats.completed = counts.completed || 0;
+      queueStats.failed = counts.failed || 0;
+      queueStats.delayed = counts.delayed || 0;
+    }
+    if (deadLetterQueue) {
+      const dlqCounts = await deadLetterQueue.getJobCounts("failed", "waiting");
+      queueStats.dlqCount = (dlqCounts.failed || 0) + (dlqCounts.waiting || 0);
+    }
+  } catch (err) {
+    logger.warn(`[getOverview] BullMQ status check failed: ${err.message}`);
+  }
+
+  // 2. Real-time Active Sockets
+  let activeSockets = 0;
+  try {
+    const io = req.app.get("io");
+    if (io) {
+      if (typeof io.fetchSockets === "function") {
+        const sockets = await io.fetchSockets();
+        activeSockets = sockets ? sockets.length : 0;
+      } else if (io.engine) {
+        activeSockets = io.engine.clientsCount || 0;
+      }
+    }
+  } catch (err) {
+    logger.warn(`[getOverview] Sockets check failed: ${err.message}`);
+  }
+
+  // 3. System Health Check
+  let health = null;
+  try {
+    health = await getHealthStatus();
+  } catch (err) {
+    health = { status: "DEGRADED", error: err.message };
+  }
+
+  // 4. MongoDB Aggregations & Metrics
+  const [
+    totalNotifications,
+    statusBreakdown,
+    totalProfiles,
+    distinctRecipients,
+    recentActivities,
+    sevenDayAgg,
+  ] = await Promise.all([
+    Notification.countDocuments({}),
+    Notification.aggregate([
+      {
+        $group: {
+          _id: "$status",
+          count: { $sum: 1 },
+        },
+      },
+    ]),
+    NotificationProfile.countDocuments({}),
+    Notification.distinct("recipientId"),
+    Notification.find({})
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .select("_id title category priority status scope channels recipientId createdAt")
+      .lean(),
+    Notification.aggregate([
+      {
+        $match: {
+          createdAt: { $gte: sevenDaysAgo },
+        },
+      },
+      {
+        $group: {
+          _id: {
+            $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
+          },
+          total: { $sum: 1 },
+          delivered: {
+            $sum: {
+              $cond: [{ $in: ["$status", ["DELIVERED", "SENT"]] }, 1, 0],
+            },
+          },
+          failed: {
+            $sum: {
+              $cond: [{ $eq: ["$status", "FAILED"] }, 1, 0],
+            },
+          },
+          queued: {
+            $sum: {
+              $cond: [{ $in: ["$status", ["QUEUED", "PENDING", "PROCESSING"]] }, 1, 0],
+            },
+          },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]),
+  ]);
+
+  // Format Status Counts
+  const statuses = {
+    DELIVERED: 0,
+    FAILED: 0,
+    QUEUED: 0,
+    PROCESSING: 0,
+    PARTIAL: 0,
+    PENDING: 0,
+  };
+  statusBreakdown.forEach((item) => {
+    if (item._id) {
+      statuses[item._id] = item.count;
+    }
+  });
+
+  // Calculate Success Rate
+  const successfulCount = statuses.DELIVERED + (statuses.SENT || 0);
+  const attemptedCount = successfulCount + statuses.FAILED + statuses.PARTIAL;
+  const successRate =
+    attemptedCount > 0
+      ? Math.round((successfulCount / attemptedCount) * 100 * 10) / 10
+      : totalNotifications > 0
+      ? 100
+      : 100;
+
+  // Total unique users (profiles or distinct recipients)
+  const totalUsers = Math.max(totalProfiles || 0, distinctRecipients ? distinctRecipients.length : 0);
+
+  // 7-day chronological chart filling
+  const daysMap = new Map();
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
+    const dateKey = d.toISOString().split("T")[0];
+    const displayLabel = d.toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric",
+    });
+    daysMap.set(dateKey, {
+      date: displayLabel,
+      fullDate: dateKey,
+      total: 0,
+      delivered: 0,
+      failed: 0,
+      queued: 0,
+    });
+  }
+
+  sevenDayAgg.forEach((item) => {
+    if (daysMap.has(item._id)) {
+      const existing = daysMap.get(item._id);
+      existing.total = item.total;
+      existing.delivered = item.delivered;
+      existing.failed = item.failed;
+      existing.queued = item.queued;
+    }
+  });
+
+  const chartData = Array.from(daysMap.values());
+
+  res.status(200).json({
+    status: "success",
+    data: {
+      metrics: {
+        totalNotifications,
+        successRate,
+        activeSockets,
+        totalUsers,
+        statuses,
+      },
+      chartData,
+      queueStatus: queueStats,
+      systemHealth: {
+        status: health?.status || "HEALTHY",
+        uptimeSeconds: health?.uptimeSeconds || Math.floor(process.uptime()),
+        services: health?.services || {},
+      },
+      recentActivities,
+    },
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// 9. Admin Live Logs History
+// GET /api/notifications/logs
+// ---------------------------------------------------------------------------
+const getLogs = catchAsync(async (req, res) => {
+  const { getBufferedLogs } = require("../utils/adminLogEmitter");
+  const logs = getBufferedLogs();
+  res.status(200).json({
+    status: "success",
+    data: { logs },
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// 10. Dispatch / Ingest Notification
+// POST /api/notifications
+// ---------------------------------------------------------------------------
+const dispatchNotification = catchAsync(async (req, res, next) => {
+  const io = req.app.get("io");
+  const { sendNotification } = require("../services/NotificationService");
+
+  const {
+    title,
+    message,
+    priority = "normal",
+    category = "GENERAL",
+    scope = "UNICAST",
+    recipientId,
+    channels = ["IN_APP"],
+    tags = [],
+    actionUrl,
+    actionData,
+    tenantId: bodyTenantId,
+  } = req.body;
+
+  if (!title || !message) {
+    return next(new AppError("Title and message are required fields.", 400));
+  }
+
+  if (scope === "UNICAST" && !recipientId) {
+    return next(new AppError("recipientId is required for UNICAST notifications.", 400));
+  }
+
+  const tenantId =
+    req.headers?.["x-tenant-id"] || bodyTenantId || req.user?.tenantId || "default";
+
+  const payload = {
+    title: title.trim(),
+    message: message.trim(),
+    priority: priority.toLowerCase(),
+    category: category.toUpperCase(),
+    scope: scope.toUpperCase(),
+    recipientId: recipientId ? String(recipientId).trim() : undefined,
+    channels: Array.isArray(channels) && channels.length > 0 ? channels : ["IN_APP"],
+    tags: Array.isArray(tags) ? tags : [],
+    actionUrl,
+    actionData,
+    tenantId,
+    senderId: req.user?.id || req.userId || "admin",
+  };
+
+  const result = await sendNotification(io, payload);
+
+  res.status(201).json({
+    status: "success",
+    message: "Notification successfully dispatched to engine pipeline",
+    data: result,
+  });
+});
+
 module.exports = {
   getNotifications,
   markAsRead,
@@ -484,4 +764,7 @@ module.exports = {
   clearAllNotifications,
   getHealth,
   getMetrics,
+  getOverview,
+  getLogs,
+  dispatchNotification,
 };

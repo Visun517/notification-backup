@@ -61,6 +61,8 @@ app.use(
  * and send real-time notifications via req.app.get('io').
  */
 app.set("io", io);
+const { setIo: setAdminLogIo } = require("./src/utils/adminLogEmitter");
+setAdminLogIo(io);
 
 /*
  * Secure the notification socket connection.

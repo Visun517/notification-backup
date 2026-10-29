@@ -70,6 +70,21 @@ const sendNotification = async (arg1, arg2 = {}) => {
     }
 
     if (!isUnique) {
+      try {
+        const { emitLiveLog } = require("../utils/adminLogEmitter");
+        emitLiveLog({
+          level: "WARN",
+          event: "IDEMPOTENCY_BLOCKED",
+          message: `Duplicate dispatch suppressed by Idempotency Guard: "${data.title || "Untitled"}" [Tenant: ${tenantId}]`,
+          tenantId,
+          details: {
+            idempotencyKey,
+            scope: data.scope,
+            title: data.title,
+            recipientId: data.recipientId,
+          },
+        });
+      } catch (_) {}
       logger.warn(
         `⚠️ [NotificationService] Duplicate dispatch blocked by Idempotency Guard: Tenant=${tenantId}, Key=${idempotencyKey}`,
       );
@@ -203,12 +218,12 @@ const sendNotification = async (arg1, arg2 = {}) => {
     let job = null;
     try {
       const enqueueFn = options.enqueueNotification || queueHelper.enqueueNotification;
+      const safeRecipientMeta = { ...(options.recipientMeta || {}) };
+      delete safeRecipientMeta.io;
+
       job = await enqueueFn(newNotification, {
         tenantId,
-        recipientMeta: {
-          io,
-          ...options.recipientMeta,
-        },
+        recipientMeta: safeRecipientMeta,
         templateContext: options.templateContext,
       });
     } catch (queueErr) {

@@ -115,6 +115,24 @@ async function enqueueNotification(notification, options = {}) {
     });
   } catch (_) { }
 
+    try {
+    const { emitLiveLog } = require("../utils/adminLogEmitter");
+    emitLiveLog({
+      level: "INFO",
+      event: "NOTIFICATION_QUEUED",
+      message: `Notification ${notifId} successfully enqueued into BullMQ dispatch-queue [Priority: ${priority}]`,
+      tenantId,
+      details: {
+        notificationId: notifId,
+        jobId: job.id,
+        priority,
+        channels: notification.channels || ["IN_APP"],
+        scope: notification.scope || "UNICAST",
+        recipientId: notification.recipientId || "BROADCAST",
+      },
+    });
+  } catch (_) {}
+
   logger.info(`📥 [NotificationQueue] Enqueued notification ${notifId} [Tenant: ${tenantId}] (Job ID: ${job.id}, Priority: ${priority})`);
   return job;
 }

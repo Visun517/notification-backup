@@ -1,3 +1,20 @@
+const { globalSearch } = require("../controllers/searchController");
+const {
+  getDLQJobs,
+  retryDLQJob,
+  retryAllDLQJobs,
+  deleteDLQJob,
+  clearAllDLQJobs,
+} = require("../controllers/dlqController");
+const { getSettings, updateSettings } = require("../controllers/settingsController");
+const {
+  getAllTemplates,
+  getTemplateById,
+  createTemplate,
+  updateTemplate,
+  deleteTemplate,
+} = require("../controllers/templateController");
+
 /**
  * Notification Routes
  *
@@ -27,6 +44,9 @@ const {
   clearAllNotifications,
   getHealth,
   getMetrics,
+  getOverview,
+  getLogs,
+  dispatchNotification,
 } = require("../controllers/notificationController");
 
 const { triggerSimulation } = require("../controllers/exampleController");
@@ -65,6 +85,45 @@ const {
 router.get("/health", getHealth);
 router.get("/metrics", getMetrics);
 
+/**
+ * GET /overview
+ * Aggregates high-level admin metrics from MongoDB, Redis, and BullMQ queues.
+ */
+router.get("/overview", getOverview);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTIFICATION TEMPLATES CRUD
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/templates", apiRateLimiter, getAllTemplates);
+router.get("/templates/:id", apiRateLimiter, getTemplateById);
+router.post("/templates", apiRateLimiter, createTemplate);
+router.put("/templates/:id", apiRateLimiter, updateTemplate);
+router.delete("/templates/:id", apiRateLimiter, deleteTemplate);
+
+router.get("/logs", getLogs);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SYSTEM SETTINGS (Global Configuration)
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/settings", apiRateLimiter, getSettings);
+router.put("/settings", apiRateLimiter, updateSettings);
+router.patch("/settings", apiRateLimiter, updateSettings);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DEAD-LETTER QUEUE (DLQ) MANAGEMENT
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/dlq", apiRateLimiter, getDLQJobs);
+router.post("/dlq/retry-all", apiRateLimiter, retryAllDLQJobs);
+router.post("/dlq/:jobId/retry", apiRateLimiter, retryDLQJob);
+router.delete("/dlq/clear-all", apiRateLimiter, clearAllDLQJobs);
+router.delete("/dlq/:jobId", apiRateLimiter, deleteDLQJob);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GLOBAL COMMAND PALETTE SEARCH
+// ─────────────────────────────────────────────────────────────────────────────
+router.get("/search", apiRateLimiter, globalSearch);
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Enforce JWT authentication on all routes below this line.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,6 +138,7 @@ router.use(protect);
  * Fetches paginated notification feed for the authenticated user.
  */
 router.get("/", apiRateLimiter, getNotifications);
+router.post("/", apiRateLimiter, dispatchNotification);
 
 /**
  * GET /unread-count

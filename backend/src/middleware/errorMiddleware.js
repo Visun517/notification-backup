@@ -1,4 +1,5 @@
 const AppError = require('../errors/appError');
+const logger = require('../utils/logger');
 
 /**
  * Helper function to handle MongoDB invalid ID errors (CastError).
@@ -52,7 +53,7 @@ module.exports = (err, req, res, next) => {
       message: err.message,
       stack: err.stack
     });
-  } 
+  }
   // --- PRODUCTION MODE ---
   else {
     // Fixed: Explicitly copy 'name' and 'code' because the spread operator (...err) ignores them
@@ -71,12 +72,16 @@ module.exports = (err, req, res, next) => {
         status: error.status,
         message: error.message
       });
-    } 
+    }
     // If it's a programming bug or unknown error, send a generic message to the user
     else {
       // 1) Log the error for the developer to see
-      console.error('ERROR ', err);
-      
+      logger.error('Unhandled Exception ', {
+        errorName: err.name,
+        message: err.message,
+        stack: err.stack
+      });
+
       // 2) Send a generic message to the client
       res.status(500).json({
         status: 'error',
